@@ -27,7 +27,6 @@ A typical user interaction follows this flow:
 4. Encrypt & send request   →  encryptForTee(payload) → submitRequest(PROCESS, ...)
 5. Wait for completion      →  getRequestCompletedEvent(requestId, ...)
 6. Decrypt response events  →  getCurrentUserEvents(...) or fetchAndDecryptUserEvents(...)
-7. Collect withdrawals      →  getPendingPayments() → withdrawPayments()
 ```
 
 ---
