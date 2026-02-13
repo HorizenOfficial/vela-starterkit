@@ -2,7 +2,7 @@
 
 The `horizen-cce-common-ts` library provides everything a browser application needs to interact with the Horizen CCE platform: key derivation from a wallet, payload encryption, request submission, event decryption, and withdrawal collection. It is designed for browser environments using the Web Crypto API.
 
-> **Prerequisite**: Read `summary.md` for the full system architecture. This document focuses on the client side — how a user's browser application communicates with the platform.
+> **Prerequisite**: Read `1_summary.md` for the full system architecture. This document focuses on the client side — how a user's browser application communicates with the platform.
 
 ---
 
