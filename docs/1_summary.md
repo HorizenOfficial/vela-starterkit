@@ -78,7 +78,7 @@ struct PendingRequest {
 }
 ```
 
-Events: `RequestSubmitted`, `RequestCompleted`, `StateRootUpdate`, `UserEvent` (encrypted), `ReportGenerated`, `Refund`, `Withdrawal`.
+Events: `RequestSubmitted`, `RequestCompleted`, `StateRootUpdate`, `UserEvent` (encrypted), `Refund`, `Withdrawal`.
 
 #### TeeAuthenticator
 
@@ -156,11 +156,12 @@ The Executor runs inside the AWS Nitro Enclave (TEE) and handles all cryptograph
 2. Deserialize into AppData (state + user key store)
 3. If deposit: call WASM deposit()
 4. If AssociateKey: register sender's P521 public key
-5. Otherwise: decrypt payload (ECDH), call WASM process_request()
-6. Encrypt new state (AES-256), compute state root (SHA256)
-7. Encrypt events using recipient P521 public keys (ECDH → AES-GCM)
-8. Sign UpdatePayload with secp256k1 SigningKey
-9. Return: UpdatePayload + encrypted ApplicationState + optional DeanonymizationReport
+5. If Deanonymize: decrypt payload (ECDH), call WASM generate_deanonymization_report()
+6. Otherwise: decrypt payload (ECDH), call WASM process_request()
+7. Encrypt new state (AES-256), compute state root (SHA256)
+8. Encrypt events using recipient P521 public keys (ECDH → AES-GCM)
+9. Sign UpdatePayload with secp256k1 SigningKey
+10. Return: UpdatePayload + encrypted ApplicationState + optional DeanonymizationReport
 ```
 
 ---
@@ -206,8 +207,9 @@ User                     Blockchain              Manager                Executor
   │                          │                      │   from LevelDB       │
   │                          │                      │── SendProcessReq ───>│
   │                          │                      │                      │─ decrypt state (AES)
+  │                          │                      │                      │─ if deposit: call WASM deposit()
   │                          │                      │                      │─ decrypt payload (ECDH)
-  │                          │                      │                      │─ execute WASM
+  │                          │                      │                      │─ call WASM process_request()
   │                          │                      │                      │─ encrypt new state
   │                          │                      │                      │─ encrypt events
   │                          │                      │                      │─ sign payload
@@ -228,7 +230,7 @@ Before a user can receive encrypted events or submit encrypted payloads, they re
 
 ### 3.4 Deanonymization
 
-An authorized authority submits a `DEANONYMIZATION` request. The WASM application generates a report (e.g., all account balances). The Executor encrypts this report with the authority's P-521 public key. The Manager stores the encrypted report on the filesystem. The authority retrieves it via the Authority Service HTTP API (`GET /nonce` + `POST /getreport`).
+An authorized authority submits a `DEANONYMIZATION` request. The Executor calls the WASM module's dedicated `generate_deanonymization_report()` export (separate from `process_request()`). The WASM application generates a report (e.g., all account balances). The Executor encrypts this report with the authority's P-521 public key. The Manager stores the encrypted report on the filesystem. The authority retrieves it via the Authority Service HTTP API (`GET /nonce` + `POST /getreport`).
 
 ---
 
@@ -248,7 +250,7 @@ Called once when the application is deployed. Returns the initial state.
 //export load_module
 func load_module(appId int64) *byte {
     result := myapp.LoadModule(appId)
-    return types.SerializeAndWriteResult(result)
+    return myapp.SerializeAndWriteResult(result)
 }
 ```
 
@@ -270,11 +272,11 @@ Called when a user sends funds (deposit) with their request.
 func deposit(appId int64, senderPtr *byte, senderLen int32,
              valuePtr *byte, valueLen int32,
              statePtr *byte, stateLen int32) *byte {
-    sender := types.PtrToAddress(senderPtr, senderLen)
-    value  := types.PtrToUint256(valuePtr, valueLen)
+    sender := myapp.PtrToAddress(senderPtr, senderLen)
+    value  := myapp.PtrToUint256(valuePtr, valueLen)
     state  := utils.PtrToString(statePtr, stateLen)
-    result := myapp.Deposit(sender, value, state)
-    return types.SerializeAndWriteResult(result)
+    result := myapp.DepositFunds(sender, value, state)
+    return myapp.SerializeAndWriteResult(result)
 }
 ```
 
@@ -288,20 +290,20 @@ type DepositResult struct {
 }
 ```
 
-#### `process_request(appId: i64, senderPtr: *byte, senderLen: i32, requestType: i32, payloadPtr: *byte, payloadLen: i32, statePtr: *byte, stateLen: i32) -> *byte`
+#### `process_request(appId: i64, senderPtr: *byte, senderLen: i32, payloadPtr: *byte, payloadLen: i32, statePtr: *byte, stateLen: i32) -> *byte`
 
-Main processing function. Called for `PROCESS`, `DEANONYMIZATION`, and `ASSOCIATEKEY` requests.
+Main processing function. Called for `PROCESS` requests. The Executor routes requests by type — only standard processing goes through this function (deanonymization has its own export, and `ASSOCIATEKEY` is handled by the Executor directly).
 
 ```go
 //export process_request
 func process_request(appId int64, senderPtr *byte, senderLen int32,
-                     requestType int32, payloadPtr *byte, payloadLen int32,
+                     payloadPtr *byte, payloadLen int32,
                      statePtr *byte, stateLen int32) *byte {
-    sender  := types.PtrToAddress(senderPtr, senderLen)
+    sender  := myapp.PtrToAddress(senderPtr, senderLen)
     payload := utils.PtrToString(payloadPtr, payloadLen)
     state   := utils.PtrToString(statePtr, stateLen)
-    result  := myapp.Process(sender, requestType, payload, state)
-    return types.SerializeAndWriteResult(result)
+    result  := myapp.ProcessRequest(sender, payload, state)
+    return myapp.SerializeAndWriteResult(result)
 }
 ```
 
@@ -311,47 +313,67 @@ type ProcessResult struct {
     State       []byte       `json:"state"`              // Updated state
     Events      []PlainEvent `json:"events"`              // Emitted events
     Withdrawals []Withdrawal `json:"withdrawals"`         // Fund transfers
-    Report      []byte       `json:"report,omitempty"`    // Deanonymization report
     Fuel        *Uint256     `json:"fuel"`                // Fuel consumed
     Error       string       `json:"error,omitempty"`
 }
 ```
 
+#### `generate_deanonymization_report(payloadPtr: *byte, payloadLen: i32, statePtr: *byte, stateLen: i32) -> *byte`
+
+Called when the Executor receives a `DEANONYMIZATION` request. This is a separate export from `process_request`. Note: no `appId` or `sender` parameters — the Executor handles authorization.
+
+```go
+//export generate_deanonymization_report
+func generate_deanonymization_report(payloadPtr *byte, payloadLen int32,
+                                     statePtr *byte, stateLen int32) *byte {
+    payload := utils.PtrToString(payloadPtr, payloadLen)
+    state   := utils.PtrToString(statePtr, stateLen)
+    result  := myapp.GenerateDeanonymizationReport(payload, state)
+    return myapp.SerializeAndWriteResult(result)
+}
+```
+
+Returns `DeanonymizationResult`:
+```go
+type DeanonymizationResult struct {
+    Report []byte   `json:"report"`            // Encrypted report data
+    Fuel   *Uint256 `json:"fuel"`              // Fuel consumed
+    Error  string   `json:"error,omitempty"`
+}
+```
+
 #### `allocate` and `deallocate`
 
-Memory management functions. These are provided by the common library (`github.com/horizen-cce-common-go/wasm/utils`); importing it is sufficient — they are auto-exported.
+Memory management functions. These must be implemented in the WASM module's `utils` package. They manage memory allocation and deallocation for data exchange between host and guest.
 
 ```go
 //export allocate
-func Allocate(size int32) int32     // provided by common lib
+func allocate(size int32) int32        // allocates memory in WASM linear memory
 
 //export deallocate
-func Deallocate(ptr *byte, size int32)  // provided by common lib
+func deallocate(ptr *byte, size int32) // frees previously allocated memory
 ```
+
+The `utils` package also provides `StringToPtr` for returning results (4-byte little-endian length prefix + data) and `PtrToString` for reading host-provided data.
 
 #### `get_memory_stats() -> *byte` (optional)
 
 Returns memory allocation statistics. Useful for debugging.
 
-### 4.2 Shared Types
+### 4.2 Types
 
-Import from `github.com/horizen-cce-common-go/wasm/types`:
+The WASM guest module defines its own types locally (not imported from the host). This is a deliberate design choice: the guest is a separate sandboxed environment compiled with TinyGo, which cannot import host packages (e.g., `go-ethereum`). Communication between host and guest happens via JSON serialization — both sides define compatible types independently.
+
+**Core types** (defined in the guest `app` package):
 
 | Type | Description |
 |------|-------------|
 | `Address` | 20-byte Ethereum address (`[20]byte`). JSON: `"0x..."` hex string. |
-| `Uint256` | 256-bit unsigned integer (`[4]uint64`). JSON: `"0x..."` hex string. Supports `Add`, `Sub`, `Mul64`, `Cmp`, overflow checks. |
+| `Uint256` | 256-bit unsigned integer (`[4]uint64`). JSON: `"0x..."` hex string. Supports `Add`, `Sub`, `Cmp`, `AddOverflow`, `IsZero`. Custom implementation (no `math/big` in TinyGo). |
 | `PlainEvent` | Event to emit: `UserID` (Address), `EventSubType` (string), `Data` ([]byte). |
 | `Withdrawal` | Withdrawal instruction: `DestinationAddress` (Address), `Amount` (*Uint256). |
 
-Import from `github.com/horizen-cce-common-go/wasm/utils`:
-
-| Function | Description |
-|----------|-------------|
-| `PtrToString(ptr, len)` | Convert WASM pointer to Go string |
-| `LogError/Warn/Info/Debug/Trace(fmt, args...)` | Logging (captured by host via WASI pipes) |
-
-Import from `github.com/horizen-cce-common-go/wasm/types`:
+**Helper functions** (defined in the guest `app` package):
 
 | Function | Description |
 |----------|-------------|
@@ -359,16 +381,26 @@ Import from `github.com/horizen-cce-common-go/wasm/types`:
 | `PtrToAddress(ptr, len)` | Convert WASM pointer to `*Address` |
 | `PtrToUint256(ptr, len)` | Convert WASM pointer to `*Uint256` |
 
+**Utility functions** (defined in the guest `utils` package):
+
+| Function | Description |
+|----------|-------------|
+| `PtrToString(ptr, len)` | Convert WASM pointer to Go string |
+| `StringToPtr(data)` | Convert Go byte slice to WASM pointer (4-byte length prefix + data) |
+| `LogError/Warn/Info/Debug/Trace(fmt, args...)` | Logging with prefixes (ERR/WRN/INF/DBG/TRC), captured by host via WASI stdout pipe |
+
 ### 4.3 Request Types
 
-The `requestType` parameter maps to:
+The Executor routes requests by type to the appropriate WASM export:
 
-| Value | Type | Description |
-|-------|------|-------------|
-| 0 | `DEPLOYAPP` | Deploy (handled via `load_module`, not `process_request`) |
-| 1 | `PROCESS` | Standard request |
-| 2 | `DEANONYMIZATION` | Must return a `Report` in the result |
-| 3 | `ASSOCIATEKEY` | Key registration (handled by Executor, not WASM) |
+| Value | Type | WASM Export Called |
+|-------|------|-------------------|
+| 0 | `DEPLOYAPP` | `load_module` |
+| 1 | `PROCESS` | `deposit` (if funds included) + `process_request` |
+| 2 | `DEANONYMIZATION` | `generate_deanonymization_report` |
+| 3 | `ASSOCIATEKEY` | None (handled entirely by the Executor) |
+
+Note: the `requestType` is **not** passed to the WASM module. The Executor determines which export to call based on the request type and invokes the correct function directly.
 
 ### 4.4 State Management
 
@@ -398,7 +430,7 @@ Each operation must return a `Fuel` value representing computation cost. Fuel is
 
 ### 4.8 Deanonymization Reports
 
-When `requestType == 2` (DEANONYMIZATION), the application **must** return a non-nil `Report` in the `ProcessResult`. The Executor encrypts this report with the requesting authority's P-521 public key. The authority retrieves it via the Authority Service.
+When the request type is `DEANONYMIZATION`, the Executor calls the dedicated `generate_deanonymization_report()` export (not `process_request()`). The application **must** return a non-nil `Report` in the `DeanonymizationResult`. The Executor encrypts this report with the requesting authority's P-521 public key. The authority retrieves it via the Authority Service.
 
 
 ### 4.9 Application-side Constraints
@@ -406,8 +438,8 @@ When `requestType == 2` (DEANONYMIZATION), the application **must** return a non
 - **TinyGo limitations**: Not all Go stdlib packages are available. Avoid `reflect`-heavy code, `net`, `os` (beyond basics), etc.
 - **Stateless execution**: All state must be serialized/deserialized each call. No global mutable state persists between invocations.
 - **Determinism**: Results must be deterministic for the same inputs. Avoid `time.Now()`, random number generation, or other non-deterministic operations.
-- **Memory**: Use the provided `allocate`/`deallocate` from the common library. The host manages memory lifecycle.
-- **Logging**: Use `utils.LogError/Warn/Info/Debug/Trace` — output is captured via WASI pipes and rate-limited (1000 logs/sec).
+- **Memory**: Implement `allocate`/`deallocate` in your `utils` package. The host manages memory lifecycle via these exports.
+- **Logging**: Use `utils.LogError/Warn/Info/Debug/Trace` — output is written to stdout with level prefixes (ERR/WRN/INF/DBG/TRC) and captured by the host via WASI pipes.
 
 ---
 
