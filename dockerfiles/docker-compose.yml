@@ -1,0 +1,275 @@
+networks:
+  pes_network:
+    internal: true
+    ipam:
+      config:
+        - subnet: ${INTERNAL_NETWORK_SUBNET}
+  inet:     
+
+volumes:
+  horizen-cce-manager-data:
+  horizen-cce-manager-reports:
+  horizen-cce-chain-data:
+  horizen-cce-logs:
+  horizen-cce-deploy-data:
+  horizen-cce-subgraph-postgres:
+  horizen-cce-subgraph-ipfs:
+
+services:
+  executor:
+    image: horizen/cce-executor:v0.0.18b
+    container_name: horizen-cce-executor
+    restart: always
+    privileged: true
+    devices:
+      - /dev/vsock:/dev/vsock
+    networks:
+      pes_network:
+        ipv4_address: ${EXECUTOR_IP_HOST}
+    environment:
+      - CHANNEL_TYPE
+      - EXECUTOR_IP_HOST
+      - EXECUTOR_PORT
+      - EXECUTOR_ADMIN_POR
+      - LOG_SERVER_IP_HOST
+      - EXECUTOR_KEYSET_RECOVERY_TYPE
+      - EXECUTOR_FUEL_PRICE_PER_UNIT
+      - EXECUTOR_MIN_FEE_PER_REQUEST
+      - EXECUTOR_LOG_KIND
+      - EXECUTOR_LOG_CONSOLE
+      - EXECUTOR_LOG_CONSOLE_LEVEL
+      - EXECUTOR_LOG_CONSOLE_COLOR
+      - EXECUTOR_LOG_FILE_NAME
+      - EXECUTOR_LOG_FILE_LEVEL
+      - EXECUTOR_LOG_PORT
+      - EXECUTOR_LOG_NETWORK_LEVEL
+      - EXECUTOR_COMMUNICATION_PARAMS_REQUEST_TIMEOUT_SEC
+      - ADMIN_COMMUNICATION_PARAMS_REQUEST_TIMEOUT_SEC
+      - EXECUTOR_FIXED_SIGNING_KEY
+      - EXECUTOR_FIXED_COMMUNICATION_KEY
+      - EXECUTOR_FIXED_STATE_KEY
+    depends_on:
+      - chain
+  manager:
+    image: horizen/cce-manager:v0.0.18b
+    container_name: horizen-cce-manager
+    restart: always
+    privileged: true
+    devices:
+      - /dev/vsock:/dev/vsock 
+    environment:
+      - CHANNEL_TYPE
+      - EXECUTOR_IP_HOST
+      - EXECUTOR_VSOCK_CID
+      - EXECUTOR_PORT  
+      - MANAGER_KEY_SECP256
+      - MANAGER_DATA_FOLDER=${MANAGER_DATA_FOLDER:-/data}
+      - MANAGER_REPORTS_FOLDER=${MANAGER_REPORTS_FOLDER:-/reports}
+      - MANAGER_INPUT_WASMS
+      # not set to a default, so if the .env does not set it (it is optional) Go app will not enable the feature
+      - MANAGER_LOG_KIND
+      - MANAGER_LOG_CONSOLE
+      - MANAGER_LOG_CONSOLE_LEVEL
+      - MANAGER_LOG_CONSOLE_COLOR
+      - MANAGER_LOG_FILE_NAME
+      - MANAGER_LOG_FILE_LEVEL
+      - MANAGER_VSOCK_CID
+      - LOG_SERVER_IP_HOST
+      - LOG_SERVER_PORT
+      - LOG_SERVER_CONSOLE
+      - LOG_SERVER_CONSOLE_LEVEL
+      - LOG_SERVER_FOLDER=${LOG_SERVER_FOLDER:-/logs}
+      - LOG_SERVER_FILE_NAME
+      - LOG_SERVER_FILE_LEVEL
+      - CHAIN_RPC_PROTOCOL
+      - CHAIN_RPC_ADDRESS
+      - CHAIN_RPC_PORT
+      - CHAIN_PROCESSOR_ADDRESS
+      - CHAIN_TEEAUTHENTICATOR_ADDRESS
+      - BLOCKCHAIN_POLLING_INTERVAL
+      - REORG_TIMEOUT
+      - HANDSHAKE_TIMEOUT
+      - MANAGER_COMMUNICATION_PARAMS_REQUEST_TIMEOUT_SEC
+    networks:
+      pes_network:
+        ipv4_address: ${MANAGER_IP_HOST}
+      inet:    
+    volumes:
+      - horizen-cce-manager-data:${MANAGER_DATA_FOLDER:-/data}
+      - horizen-cce-manager-reports:${MANAGER_REPORTS_FOLDER:-/reports}
+      # WASM input folder
+      - ./wasms:${MANAGER_INPUT_WASMS:-/input_wasms}
+      - horizen-cce-logs:${LOG_SERVER_FOLDER:-/logs}
+      - horizen-cce-deploy-data:/deploy-data:ro
+    depends_on:
+      executor:
+        condition: service_started
+      deployer:
+        condition: service_completed_successfully
+  authorityservice:
+    image: horizen/cce-authorityservice:v0.0.18b
+    container_name: horizen-cce-authorityservice
+    restart: always
+    ports:
+      - "8081:8081"
+    environment:
+      - AUTHORITY_SERVICE_LISTEN_ADDRESS
+      - CHAIN_ID
+      - AUTHORITY_SERVICE_NONCE_TTL
+      - CHAIN_RPC_PROTOCOL
+      - CHAIN_RPC_ADDRESS
+      - CHAIN_RPC_PORT
+      - CHAIN_PROCESSOR_ADDRESS
+      - AUTHORITY_SERVICE_SUBGRAPH_URL
+      - MANAGER_REPORTS_FOLDER=${MANAGER_REPORTS_FOLDER:-/reports}
+      - AUTHORITY_SERVICE_LOG_CONSOLE
+      - AUTHORITY_SERVICE_LOG_CONSOLE_LEVEL
+      - AUTHORITY_SERVICE_LOG_CONSOLE_COLOR
+      - AUTHORITY_SERVICE_LOG_FILE_NAME
+      - AUTHORITY_SERVICE_LOG_FILE_LEVEL
+    networks:
+      pes_network:
+        ipv4_address: ${AUTHORITY_SERVICE_IP_ADDRESS}
+      inet:
+    volumes:
+      - horizen-cce-manager-reports:${MANAGER_REPORTS_FOLDER:-/reports}
+      - horizen-cce-deploy-data:/deploy-data:ro
+    depends_on:
+      manager:
+        condition: service_started
+      deployer:
+        condition: service_completed_successfully
+      subgraph-deployer:
+        condition: service_completed_successfully
+  chain:
+    image: horizen/cce-chain:v0.0.18b
+    container_name: horizen-cce-chain
+    restart: always
+    environment:
+      - DATA_FOLDER=${CHAIN_DATA_FOLDER:-/data}
+      - RPCPORT=${CHAIN_RPC_PORT:-8545}
+    ports:
+      - "${CHAIN_RPC_PORT}:${CHAIN_RPC_PORT}"
+    networks:
+      pes_network:
+        ipv4_address: ${CHAIN_RPC_ADDRESS}
+      inet:
+    volumes:
+      - horizen-cce-chain-data:${CHAIN_DATA_FOLDER:-/data}
+  deployer:
+    image: horizen/cce-deployer:v0.0.18b
+    container_name: horizen-cce-deployer
+    restart: "no"
+    environment:
+      - CHAIN_RPC_URL=http://${CHAIN_RPC_ADDRESS}:${CHAIN_RPC_PORT:-8545}
+      - NETWORK=local
+      - PRIVATE_KEY=${DEPLOYER_PRIVATE_KEY}
+      - ADMIN=${DEPLOYER_ADMIN}
+      - UPDATE_STATUS_OPERATOR=${UPDATE_STATUS_OPERATOR}
+      - TEE_PCR0=${TEE_PCR0:-}
+      - TEE_MAX_VERIFICATION_AGE=${TEE_MAX_VERIFICATION_AGE:-}
+      - TEE_NO_ATTESTATION=${TEE_NO_ATTESTATION}
+      - TEE_SIGNER_ADDRESS=${TEE_SIGNER_ADDRESS}
+      - TEE_PUB_P521=${TEE_PUB_P521}
+      - MIN_FEE_PER_REQUEST=${MIN_FEE_PER_REQUEST}
+      - DEPLOY_OUTPUT_DIR=/deploy-data
+    networks:
+      pes_network:
+    volumes:
+      - horizen-cce-deploy-data:/deploy-data
+    depends_on:
+      chain:
+        condition: service_started
+  subgraph-postgres:
+    image: postgres:14
+    container_name: horizen-cce-subgraph-postgres
+    restart: always
+    command:
+      [
+        "postgres",
+        "-cshared_preload_libraries=pg_stat_statements",
+        "-cmax_connections=200",
+      ]
+    environment:
+      POSTGRES_USER: graph-node
+      POSTGRES_PASSWORD: let-me-in
+      POSTGRES_DB: graph-node
+      PGDATA: "/var/lib/postgresql/data"
+      POSTGRES_INITDB_ARGS: "-E UTF8 --locale=C"
+    networks:
+      pes_network:
+    volumes:
+      - horizen-cce-subgraph-postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U graph-node"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+  subgraph-ipfs:
+    image: ipfs/kubo:v0.17.0
+    container_name: horizen-cce-subgraph-ipfs
+    restart: always
+    networks:
+      pes_network:
+    volumes:
+      - horizen-cce-subgraph-ipfs:/data/ipfs
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        set -e
+        ipfs init --profile=server 2>/dev/null || true
+        ipfs bootstrap rm --all
+        ipfs config Addresses.API /ip4/0.0.0.0/tcp/5001
+        exec ipfs daemon --migrate=true
+    healthcheck:
+      test: ["CMD-SHELL", "ipfs id"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+  subgraph-node:
+    image: graphprotocol/graph-node
+    container_name: horizen-cce-subgraph-node
+    restart: always
+    ports:
+      - "8000:8000"
+    environment:
+      postgres_host: subgraph-postgres
+      postgres_user: graph-node
+      postgres_pass: let-me-in
+      postgres_db: graph-node
+      ipfs: "subgraph-ipfs:5001"
+      ethereum: "local:http://${CHAIN_RPC_ADDRESS}:${CHAIN_RPC_PORT}"
+      GRAPH_LOG: info
+    networks:
+      pes_network:
+      inet:
+    depends_on:
+      subgraph-postgres:
+        condition: service_healthy
+      subgraph-ipfs:
+        condition: service_healthy
+      chain:
+        condition: service_started
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z localhost 8030"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 20s
+  subgraph-deployer:
+    image: horizen/cce-subgraph-deployer:v0.0.18b
+    container_name: horizen-cce-subgraph-deployer
+    restart: "no"
+    environment:
+      - GRAPH_NODE_URL=http://subgraph-node:8020
+      - IPFS_URL=http://subgraph-ipfs:5001
+    networks:
+      pes_network:
+    volumes:
+      - horizen-cce-deploy-data:/deploy-data:ro
+    depends_on:
+      subgraph-node:
+        condition: service_healthy
+      deployer:
+        condition: service_completed_successfully
