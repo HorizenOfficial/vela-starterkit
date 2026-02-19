@@ -4,6 +4,7 @@ This document walks through the implementation of a real WASM application for th
 It shows some code snippets in GO language.
 
 > **Prerequisite**: Read `1_summary.md` first for the full system architecture (smart contracts, Manager, Executor, cryptographic design). This document focuses on the guest application — the WASM module you write and deploy.
+
 App code is available in the following repository:
 
 https://github.com/HorizenOfficial/horizen-pes-nova <br>
@@ -54,7 +55,7 @@ The key insight: **`main.go` is a thin bridge** that converts raw WASM pointers 
 
 The app references main horizen-pes repo for some common code:
 
-
+```
 require (
     github.com/horizen-pes v0.0.18
 )
@@ -453,6 +454,9 @@ For deanonymization, the payload is an empty JSON object. The Executor calls the
 
 Events are the only way to communicate results back to users. 
 Each event targets a specific user and is encrypted with their registered P-521 key.
+
+Every app must define its own event. <br>
+Here are the payload formats your app defines:
 
 ### Event Types
 
