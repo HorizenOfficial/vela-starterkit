@@ -55,9 +55,9 @@ Currently only  a single-app manual deployment is supported:
 - launch a deploy app command with app id = 1 to initialize it
 
 ### Practical how-to for the horizen-pes-nova test app (Private transfer):
-- go to https://github.com/HorizenOfficial/horizen-pes-nova/releases/tag/v0.0.18
+- go to https://github.com/HorizenOfficial/horizen-pes-nova/releases/tag/v0.0.18 <br>
 *(look for 0.0.18 tag for a compatible version with this dev enviroment)*
-- use payment_app.wasm (remember to rename to 1.wasm)
+- download payment_app.wasm into the wasms/ folder and rename to 1.wasm
 - use the nova-linux wallet executable to launch the deploy command and interact with the app.
 
     Use wallet.conf.template as wallet config file, with the following properties set to connect to this dev environment:
@@ -70,14 +70,16 @@ Currently only  a single-app manual deployment is supported:
     SubgraphURL=http://localhost:8000/subgraphs/name/hcce
     ```
 
+    Type "./nova-linux help" on a terminal to have an help on the wallet commands.
+
 ### Other useful repositories to look into:
 
-https://github.com/HorizenOfficial/horizen-cce-common-ts
-
-TypeScript library for interacting with Horizen CCE (Confidential Computing Environment) smart contracts.
-Provides P-521 ECDH encryption and a blockchain client optimized for browser applications.
-
+- https://github.com/HorizenOfficial/horizen-cce-common-ts <br>
 *(look for 0.0.18 tag for a compatible version with this dev enviroment)*
+
+    TypeScript library for interacting with Horizen CCE (Confidential Computing Environment) smart contracts.<br>
+    Provides P-521 ECDH encryption and a blockchain client optimized for browser applications.
+
 
 
 
