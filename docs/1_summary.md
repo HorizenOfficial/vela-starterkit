@@ -1,8 +1,8 @@
-# Vela CCE - Architecture Summary (v0.0.25)
+# Vela - Architecture Summary (v0.0.25)
 
 ## 1. System Overview
 
-Vela CCE (Confidential Compute Environment) is a platform that executes WebAssembly (WASM) modules inside AWS Nitro Enclaves (TEE), with encrypted state management and blockchain-based coordination. Users submit requests on-chain; the system processes them securely off-chain and posts signed results back to the blockchain.
+Vela  is a platform that executes WebAssembly (WASM) modules inside AWS Nitro Enclaves (TEE), with encrypted state management and blockchain-based coordination. Users submit requests on-chain; the system processes them securely off-chain and posts signed results back to the blockchain.
 
 ```
                                  ┌──────────────────────────────────┐

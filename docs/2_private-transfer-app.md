@@ -1,4 +1,4 @@
-# Building a Private Transfer App on Vela CCE (v0.0.25)
+# Building a Private Transfer App on Vela (v0.0.25)
 
 This document walks through the implementation of a real WASM application for the Vela CCE platform: a **private transfer app** that supports deposits, account-to-account transfers, withdrawals to external addresses, and regulatory deanonymization. It serves as a practical reference for developers building their own applications.
 It shows some code snippets in GO language.

@@ -1,4 +1,4 @@
-# Vela CCE TypeScript Client Library (v0.0.25)
+# Vela TypeScript Client Library (v0.0.25)
 
 The `vela-common-ts` library provides everything a browser application needs to interact with the Vela CCE platform: key derivation from a wallet, payload encryption, request submission, event decryption, and withdrawal collection. It is designed for browser environments using the Web Crypto API.
 

@@ -1,6 +1,6 @@
-# Horizen Confidential Compute Environment - Developer Onboarding Kit
+# Horizen Vela - Developer Strter Kit
 
-This repository contains the resources needed to implement and test a Proof of Concept based on Horizen CCE — a platform that executes WebAssembly (WASM) modules inside AWS Nitro Enclaves (TEE), with encrypted state management and blockchain-based coordination.
+This repository contains the resources needed to implement and test a Proof of Concept based on Horizen Vela — a platform that executes WebAssembly (WASM) modules inside AWS Nitro Enclaves (TEE), with encrypted state management and blockchain-based coordination.
 
 ## Documentation
 
