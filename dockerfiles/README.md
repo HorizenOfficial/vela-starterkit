@@ -1,5 +1,5 @@
 This folder contains an example docker compose to be used for debug/demo.<br>
-It starts a dev chain using [Foundry Anvil](https://getfoundry.sh/anvil/overview), automatically deploys the smart contracts, and runs all the components of Horizen CCE locally.
+It starts a dev chain using [Foundry Anvil](https://getfoundry.sh/anvil/overview), automatically deploys the smart contracts, and runs all the components of Vela CCE locally.
 
 #### Limitations of this dev enviroment:
 
@@ -31,10 +31,11 @@ It starts a dev chain using [Foundry Anvil](https://getfoundry.sh/anvil/overview
 
 ## Additional info:
 
-- the manager database and chain data are persisted in docker volumes (`horizen-cce-manager-data` for the DB, `horizen-cce-chain-data` for chain data).<br>
+- the manager database and chain data are persisted in docker volumes (`vela-skit-manager-data` for the DB, `vela-skit-chain-data` for chain data).<br>
   To start from scratch, delete the volumes.
-- deployed contract addresses are stored in the `horizen-cce-deploy-data` volume. The deployer checks this on startup and skips deployment if contracts are already present on the chain.
-- deanonymization reports are stored in `horizen-cce-manager-reports`; the authority service shares this reports volume so it can read the same outputs.
+- deployed contract addresses are stored in the `vela-skit-deploy-data` volume. The deployer checks this on startup and skips deployment if contracts are already present on the chain.
+- deanonymization reports are stored in `vela-skit-manager-reports`; the authority service shares this reports volume so it can read the same outputs.
+- centralized logs are stored in `vela-skit-logs`.
 - to connect to the chain from Metamask, use the following parameters:
    - rpc url: http://localhost:8545
    - chainid: 31337
@@ -43,8 +44,8 @@ It starts a dev chain using [Foundry Anvil](https://getfoundry.sh/anvil/overview
 ## Restarting and volume management
 
 - **Restart without deleting volumes**: the deployer detects existing contracts and skips deployment. Fast restart.
-- **Chain data deleted** (`docker volume rm dockerfiles_horizen-cce-chain-data`): the deployer detects contracts are missing from the chain and redeploys.
-- **Deploy data deleted** (`docker volume rm dockerfiles_horizen-cce-deploy-data`): the deployer redeploys (same addresses since Anvil is deterministic with the same nonce).
+- **Chain data deleted** (`docker volume rm dockerfiles_vela-skit-chain-data`): the deployer detects contracts are missing from the chain and redeploys.
+- **Deploy data deleted** (`docker volume rm dockerfiles_vela-skit-deploy-data`): the deployer redeploys (same addresses since Anvil is deterministic with the same nonce).
 - **Contracts modified**: rebuild the deployer image, delete both volumes, and restart.
 
 ## Where to go next
@@ -82,10 +83,10 @@ Currently only  a single-app manual deployment is supported:
 
     Then you can try the following ones:
 
-    /nova-linux registeruser <br>
-    /nova-linux getpublicbalance <br>
-    /novaw-linux deposit -a "1 ETH" <br>
-    /nova-linux getprivatebalance <br>
+    ./nova-linux registeruser <br>
+    ./nova-linux getpublicbalance <br>
+    ./nova-linux deposit -a "1 ETH" <br>
+    ./nova-linux getprivatebalance <br>
 
 
 
@@ -94,7 +95,7 @@ Currently only  a single-app manual deployment is supported:
 - https://github.com/HorizenOfficial/vela-common-ts <br>
 *(look for 0.0.25 tag for a compatible version with this dev enviroment)*
 
-    TypeScript library for interacting with Horizen CCE (Confidential Computing Environment) smart contracts.<br>
+    TypeScript library for interacting with Vela CCE (Confidential Computing Environment) smart contracts.<br>
     Provides P-521 ECDH encryption and a blockchain client optimized for browser applications.
 
 
