@@ -1,15 +1,17 @@
-# Horizen CCE TypeScript Client Library
+# Vela TypeScript Client Library (v0.0.25)
 
-The `horizen-cce-common-ts` library provides everything a browser application needs to interact with the Horizen CCE platform: key derivation from a wallet, payload encryption, request submission, event decryption, and withdrawal collection. It is designed for browser environments using the Web Crypto API.
+The `vela-common-ts` library provides everything a browser application needs to interact with the Vela CCE platform: key derivation from a wallet, payload encryption, request submission, event decryption, and withdrawal collection. It is designed for browser environments using the Web Crypto API.
 
 > **Prerequisite**: Read `1_summary.md` for the full system architecture. This document focuses on the client side — how a user's browser application communicates with the platform.
+
+Source code: https://github.com/HorizenOfficial/vela-common-ts
 
 ---
 
 ## Installation
 
 ```bash
-npm install horizen-cce-common-ts ethers
+npm install vela-common-ts ethers
 ```
 
 `ethers` v6 is a peer dependency (used for wallet integration and contract interaction).
@@ -22,11 +24,12 @@ A typical user interaction follows this flow:
 
 ```
 1. Connect wallet           →  ethersSignerFromBrowser()
-2. Initialize client        →  new HorizenCCEClient(signer, ...)
+2. Initialize client        →  new VelaClient(signer, ...)
 3. Register encryption key  →  submitRequest(ASSOCIATEKEY, ...)
 4. Encrypt & send request   →  encryptForTee(payload) → submitRequest(PROCESS, ...)
 5. Wait for completion      →  getRequestCompletedEvent(requestId, ...)
 6. Decrypt response events  →  getCurrentUserEvents(...) or fetchAndDecryptUserEvents(...)
+7. Collect withdrawals      →  getPendingPayments(...) → withdrawPayments(...)
 ```
 
 ---
@@ -34,7 +37,7 @@ A typical user interaction follows this flow:
 ## Connecting a Wallet
 
 ```typescript
-import { ethersSignerFromBrowser } from "horizen-cce-common-ts";
+import { ethersSignerFromBrowser } from "vela-common-ts";
 
 // Get signer from MetaMask (or any injected wallet)
 const signer = await ethersSignerFromBrowser();
@@ -47,9 +50,9 @@ This uses `window.ethereum` to create an ethers.js `BrowserProvider` and returns
 ## Initializing the Client
 
 ```typescript
-import { HorizenCCEClient } from "horizen-cce-common-ts";
+import { VelaClient } from "vela-common-ts";
 
-const client = new HorizenCCEClient(
+const client = new VelaClient(
   signer,
   false,                          // useAlternativeSign (true for eth_sign RPC)
   "0x<TeeAuthenticator address>", // TEE Authenticator contract
@@ -81,7 +84,7 @@ const keyPair = await client.getSignerKeyPair();
 
 ### How It Works
 
-1. The library asks the wallet to sign a challenge message 
+1. The library asks the wallet to sign a challenge message
 2. The signature bytes become the Input Keying Material (IKM) for HKDF
 3. HKDF derives a P-521 private key using rejection sampling
 4. The public key is computed from the private key
@@ -92,7 +95,7 @@ wallet.signMessage("horizen0x1234...")
        ▼ signature bytes (IKM)
     HKDF-SHA256(ikm, salt=[], info=[])
        │
-       ▼ 528-bit output
+       ▼ 528-bit output (MSB masked to 521 bits)
     rejection sampling → valid P-521 private key
        │
        ▼
@@ -109,11 +112,15 @@ For advanced use cases, the library also exports lower-level key operations:
 import {
   deriveP521PrivateKeyFromSigner,  // derive from any ethers Signer
   deriveKeyPairFromHKDF,            // derive from raw IKM bytes
-  deriveKeyPairFromSeed,            // derive from a seed
+  deriveKeyPairFromSeed,            // derive from a seed (uses SHA-512)
+  generateKeyPair,                  // generate a random P-521 key pair
   importPublicKeyFromHex,           // import a public key from hex
   exportPublicKeyToHex,             // export a public key to hex
+  importPrivateKeyFromHex,          // import a private key from hex (d value)
+  importPrivateKeyFromJWK,          // import a private key from JWK
+  exportPrivateKeyToJWK,            // export a private key to JWK
   P521KeyPair,
-} from "horizen-cce-common-ts";
+} from "vela-common-ts";
 
 // Derive with custom challenge/salt/info
 const keyPair = await deriveP521PrivateKeyFromSigner(
@@ -129,6 +136,10 @@ const teePubKey = await importPublicKeyFromHex("04abcdef...");
 
 // Export for display or storage
 const hexPubKey = await exportPublicKeyToHex(keyPair.publicKey);
+
+// Import/export private keys
+const privKey = await importPrivateKeyFromHex("abcdef...");
+const jwk = await exportPrivateKeyToJWK(keyPair.privateKey);
 ```
 
 ---
@@ -138,7 +149,7 @@ const hexPubKey = await exportPublicKeyToHex(keyPair.publicKey);
 Before you can receive encrypted events or submit encrypted payloads, your P-521 public key must be registered on-chain via an `ASSOCIATEKEY` request.
 
 ```typescript
-import { RequestType, exportPublicKeyToHex } from "horizen-cce-common-ts";
+import { RequestType, exportPublicKeyToHex } from "vela-common-ts";
 
 const keyPair = await client.getSignerKeyPair();
 const publicKeyHex = await exportPublicKeyToHex(keyPair.publicKey);
@@ -165,14 +176,15 @@ The Executor stores your public key in the application's user key store. All fut
 ### Encrypt and Submit
 
 ```typescript
-import { RequestType, stringToBytes } from "horizen-cce-common-ts";
+import { RequestType, stringToBytes } from "vela-common-ts";
 
 // 1. Build your payload (application-specific JSON)
 const payload = JSON.stringify({
   type: "transfer",
   transfer: {
     to: "0x1234567890abcdef1234567890abcdef12345678",
-    amount: "0x6f05b59d3b20000"  // 0.5 ETH in hex
+    amount: "0x6f05b59d3b20000",  // 0.5 ETH in hex
+    invoice_id: "INV-2025-001"     // optional tracking ID
   }
 });
 
@@ -245,7 +257,7 @@ const result = await client.getRequestCompletedEvent(
 );
 
 if (result) {
-  console.log("Status:", result.status);         // 0 = success
+  console.log("Status:", result.status);         // 0n = success
   console.log("Error:", result.errorMessage);     // undefined if success
 }
 ```
@@ -293,7 +305,7 @@ import {
   fetchAndDecryptUserEvents,
   importPublicKeyFromHex,
   bytesToString,
-} from "horizen-cce-common-ts";
+} from "vela-common-ts";
 
 // Create subgraph client
 const subgraph = createSubgraphClient(
@@ -328,7 +340,7 @@ for (const eventBytes of events) {
 }
 ```
 
-`fetchAndDecryptUserEvents` handles pagination automatically — it fetches pages of events from the subgraph, attempts decryption on each, and accumulates results until the limit is reached.
+`fetchAndDecryptUserEvents` handles pagination automatically — it fetches pages of events from the subgraph (up to 1000 per page), attempts decryption on each, and accumulates results until the limit is reached.
 
 ### Subgraph Types
 
@@ -352,22 +364,44 @@ interface RequestCompleted {
   blockNumber: number;
 }
 ```
---
+
+---
+
+## Withdrawals (Pull Payments)
+
+After a withdrawal is processed by the WASM application, the smart contract credits the destination address via pull-payment. The recipient must explicitly withdraw their funds:
+
+```typescript
+// Check pending payments for an address
+const pending = await client.getPendingPayments(userAddress);
+console.log("Pending withdrawal:", pending, "wei");
+
+// Withdraw funds
+if (pending > 0n) {
+  const tx = await client.withdrawPayments(userAddress);
+  await tx.wait();
+  console.log("Withdrawal completed");
+}
+```
+
+---
 
 ## Low-Level Encryption / Decryption
 
-For cases where you need direct control over encryption (e.g., encrypting a deanonymization report, or working outside the `HorizenCCEClient`):
+For cases where you need direct control over encryption (e.g., encrypting a deanonymization report, or working outside the `VelaClient`):
 
 ```typescript
 import {
   encrypt,
   decrypt,
+  encryptWithAES,
+  decryptWithAES,
   importPublicKeyFromHex,
   stringToBytes,
   bytesToString,
-} from "horizen-cce-common-ts";
+} from "vela-common-ts";
 
-// Encrypt a message for a known public key
+// Encrypt a message for a known public key (ECDH + AES-256-GCM)
 const receiverPubKey = await importPublicKeyFromHex("04abcdef...");
 const myKeyPair = await client.getSignerKeyPair();
 
@@ -395,6 +429,14 @@ The encryption scheme:
 
 This format is compatible with the Go implementation in the Executor — messages encrypted in TypeScript can be decrypted by the TEE, and vice versa.
 
+Lower-level AES functions are also available for direct use:
+
+```typescript
+// Encrypt/decrypt with a raw AES-256-GCM CryptoKey
+const encrypted = await encryptWithAES(aesKey, plainBytes);
+const decrypted = await decryptWithAES(aesKey, encrypted);
+```
+
 ---
 
 ## Utility Functions
@@ -405,7 +447,59 @@ import {
   bytesToHex,     // Uint8Array → "abcd" (no 0x prefix)
   stringToBytes,  // "hello" → Uint8Array (UTF-8)
   bytesToString,  // Uint8Array → "hello" (UTF-8)
-} from "horizen-cce-common-ts";
+} from "vela-common-ts";
 ```
 
 ---
+
+## Full API Reference
+
+### VelaClient Methods
+
+| Method | Description |
+|--------|-------------|
+| `submitRequest(...)` | Submit a request to the CCE (returns transaction response) |
+| `submitRequestAndWaitForRequestId(...)` | Submit and wait for request ID (returns `RequestReceipt`) |
+| `encryptForTee(data)` | Encrypt data for the TEE using ECDH |
+| `getTeePublicKey()` | Get the TEE's P-521 public key from the contract |
+| `getSignerKeyPair()` | Derive the user's P-521 key pair from their wallet |
+| `getRequestCompletedEvent(requestId, fromBlock, toBlock)` | Query for request completion (returns `RequestResult`) |
+| `getCurrentUserEvents(fromBlock, toBlock, applicationId, eventSubType, filter, stopAtFirst)` | Get and decrypt events for current user |
+| `decryptAndFilterEvents(events, filter, stopAtFirst)` | Decrypt and filter raw contract events |
+| `getPendingPayments(address)` | Check pending withdrawal balance for an address |
+| `withdrawPayments(payee)` | Execute withdrawal of pending payments |
+
+### Crypto Exports
+
+| Export | Description |
+|--------|-------------|
+| `encrypt(privateKey, publicKey, message)` | ECDH + AES-256-GCM encryption |
+| `decrypt(privateKey, publicKey, ciphertext)` | ECDH + AES-256-GCM decryption |
+| `encryptWithAES(key, message)` | Direct AES-256-GCM encryption |
+| `decryptWithAES(key, ciphertext)` | Direct AES-256-GCM decryption |
+| `deriveP521PrivateKeyFromSigner(signer, useAltSign, ...)` | Derive P-521 from wallet |
+| `deriveKeyPairFromHKDF(ikm, salt, info)` | Derive P-521 from HKDF |
+| `deriveKeyPairFromSeed(seed)` | Derive P-521 from seed (SHA-512) |
+| `generateKeyPair()` | Generate random P-521 key pair |
+| `importPublicKeyFromHex(hex)` | Import public key from hex |
+| `exportPublicKeyToHex(key)` | Export public key to hex |
+| `importPrivateKeyFromHex(hex)` | Import private key from hex (d value) |
+| `importPrivateKeyFromJWK(jwk)` | Import private key from JWK |
+| `exportPrivateKeyToJWK(key)` | Export private key to JWK |
+
+### Subgraph Exports
+
+| Export | Description |
+|--------|-------------|
+| `createSubgraphClient(endpoint, timeoutMs)` | Create a subgraph client instance |
+| `fetchAndDecryptUserEvents(client, teePubKey, privKey, appId, subType, limit, filter)` | Fetch and decrypt events with pagination |
+| `userEventSortKey(event)` | Compute sort key for pagination cursor |
+| `MockSubgraphClient` | Mock implementation for testing |
+
+### Constants
+
+| Export | Value | Description |
+|--------|-------|-------------|
+| `CHALLENGE` | `"horizen"` | Default challenge prefix for key derivation |
+| `HKDF_SALT` | `Uint8Array(0)` | Default HKDF salt (empty) |
+| `HKDF_INFO` | `Uint8Array(0)` | Default HKDF info (empty) |

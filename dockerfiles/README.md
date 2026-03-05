@@ -5,7 +5,7 @@ It starts a dev chain using [Foundry Anvil](https://getfoundry.sh/anvil/overview
 
 - the TEE is only emulated (no real AWS Nitro Enclave is used, just a separate process)
 - only one single app deployment is supported - the app must have appId 1
-- based on horizen-pes  0.0.18 tag 
+- based on horizen-pes  0.0.25 tag
 
 ## Instructions:
 
@@ -54,13 +54,13 @@ Currently only  a single-app manual deployment is supported:
 - the app wasm *must* be named *1.wasm* and put manually into the wasms/ folder before launching the deploy app command
 - launch a deploy app command with app id = 1 to initialize it
 
-### Practical how-to for the horizen-pes-nova test app (Private transfer):
-- go to https://github.com/HorizenOfficial/horizen-pes-nova/releases/tag/v0.0.18 <br>
-*(look for 0.0.18 tag for a compatible version with this dev enviroment)*
+### Practical how-to for the vela-nova test app (Private transfer):
+- go to https://github.com/HorizenOfficial/vela-nova/releases/tag/v0.0.25 <br>
+*(look for 0.0.25 tag for a compatible version with this dev enviroment)*
 - download payment_app.wasm into the wasms/ folder and rename to 1.wasm
-- use the nova-linux wallet executable to launch the deploy command and interact with the app.
+- download the nova-linux wallet executable (linux environment only) locally to interact with the app.
 
-    Use wallet.conf.template as wallet config file, with the following properties set to connect to this dev environment:
+    Use wallet.conf.template (rename it to wallet.conf) as wallet config file, with the following properties set to connect to this dev environment:
     
     ```
     rpcUrl=http://localhost:8545
@@ -69,13 +69,30 @@ Currently only  a single-app manual deployment is supported:
     AuthorityServiceURL=http://localhost:8081
     SubgraphURL=http://localhost:8000/subgraphs/name/hcce
     ```
+    You  will need also to set two keys property:
+    - keySecp256k1 property: you can use one of the private keys of the defaults Anvill accounts, which are pre-founded with 1000 ETH.
+    - keyP521 (used for private communication with the TEE): you can generate one with: <br>
+    ./nova-linux generatkeys
 
     Type "./nova-linux help" on a terminal to have an help on the wallet commands.
 
+    You will need to deploy the app  first:
+
+    ./nova-linux deployapp 1
+
+    Then you can try the following ones:
+
+    /nova-linux registeruser <br>
+    /nova-linux getpublicbalance <br>
+    /novaw-linux deposit -a "1 ETH" <br>
+    /nova-linux getprivatebalance <br>
+
+
+
 ### Other useful repositories to look into:
 
-- https://github.com/HorizenOfficial/horizen-cce-common-ts <br>
-*(look for 0.0.18 tag for a compatible version with this dev enviroment)*
+- https://github.com/HorizenOfficial/vela-common-ts <br>
+*(look for 0.0.25 tag for a compatible version with this dev enviroment)*
 
     TypeScript library for interacting with Horizen CCE (Confidential Computing Environment) smart contracts.<br>
     Provides P-521 ECDH encryption and a blockchain client optimized for browser applications.

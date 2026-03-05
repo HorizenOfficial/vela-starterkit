@@ -1,14 +1,14 @@
-# Building a Private Transfer App on Horizen CCE
+# Building a Private Transfer App on Vela (v0.0.25)
 
-This document walks through the implementation of a real WASM application for the Horizen CCE platform: a **private transfer app** that supports deposits, account-to-account transfers, withdrawals to external addresses, and regulatory deanonymization. It serves as a practical reference for developers building their own applications.
+This document walks through the implementation of a real WASM application for the Vela CCE platform: a **private transfer app** that supports deposits, account-to-account transfers, withdrawals to external addresses, and regulatory deanonymization. It serves as a practical reference for developers building their own applications.
 It shows some code snippets in GO language.
 
 > **Prerequisite**: Read `1_summary.md` first for the full system architecture (smart contracts, Manager, Executor, cryptographic design). This document focuses on the guest application — the WASM module you write and deploy.
 
 App code is available in the following repository:
 
-https://github.com/HorizenOfficial/horizen-pes-nova <br>
-*(this guide is based on 0.0.18 tag)*
+https://github.com/HorizenOfficial/vela-nova <br>
+*(this guide is based on v0.0.25 tag)*
 
 
 
@@ -33,19 +33,15 @@ The private transfer app implements a simple account-based ledger running inside
 runtime/wasm-go/
   main.go              # WASM exports (bridge layer)
   app/
-    types.go           # Application-specific types (state, instructions, events, local type replacements)
-    uint256.go         # Custom 256-bit unsigned integer implementation
+    types.go           # Application-specific types (state, instructions, events)
     app.go             # Core business logic
-  utils/
-    utils.go           # Memory management (allocate/deallocate) and data translation
-    logger.go          # Logging functions for TinyGo WASI
   Makefile             # Build targets (dev and production)
-  go.mod               # Dependencies
+  go.mod               # Dependencies (vela, vela-common-go)
   integration_test.go  # Tests against the WASM runtime
   system_tests/        # Full end-to-end tests (deploy, encrypt, blockchain)
 ```
 
-The key insight: **`main.go` is a thin bridge** that converts raw WASM pointers into Go types and delegates to the `app` package. All business logic lives in `app/`. Memory management and WASM utilities live in `utils/`.
+The key insight: **`main.go` is a thin bridge** that converts raw WASM pointers into Go types and delegates to the `app` package. All business logic lives in `app/`. Core types (`Address`, `Uint256`, `PlainEvent`, result structs), memory management (`allocate`/`deallocate`), and WASM utilities are provided by the shared library `vela-common-go`.
 
 ---
 
@@ -53,20 +49,23 @@ The key insight: **`main.go` is a thin bridge** that converts raw WASM pointers 
 
 ### go.mod
 
-The app references main horizen-pes repo for some common code:
+The app references the main vela repository and the shared WASM types library:
 
 ```
 require (
-    github.com/horizen-pes v0.0.18
+    github.com/HorizenOfficial/vela v0.0.25
+    github.com/HorizenOfficial/vela-common-go v0.0.25
 )
 ```
 
-The WASM guest module defines all its types locally — it does **not** import types from a common library. This is a deliberate design choice: the guest is a sandboxed TinyGo environment that cannot import host packages (e.g., `go-ethereum`). Communication between host and guest happens via JSON serialization, with both sides defining compatible types independently.
+In v0.0.25, common WASM types (`Address`, `Uint256`, `PlainEvent`, `Withdrawal`, result structs) and helper functions are provided by the shared library `vela-common-go`. The guest still communicates with the host via JSON serialization, but type definitions are now shared across WASM applications rather than duplicated in each one.
 
 | Package | Provides |
 |---------|----------|
-| `app` (local) | Business logic, local type definitions (`Address`, `Uint256`, `PlainEvent`, `Withdrawal`, result types), serialization helpers (`SerializeAndWriteResult`, `PtrToAddress`, `PtrToUint256`) |
-| `utils` (local) | Memory management (`allocate`/`deallocate`, `StringToPtr`), pointer conversion (`PtrToString`), logging (`LogError/Warn/Info/Debug/Trace`) |
+| `vela-common-go/wasm/types` | Core types (`Address`, `Uint256`, `PlainEvent`, `Withdrawal`), result types (`LoadModuleResult`, `DepositResult`, `ProcessResult`), serialization helpers (`SerializeAndWriteResult`, `PtrToAddress`, `PtrToUint256`) |
+| `vela-common-go/wasm/utils` | Memory management (`allocate`/`deallocate`, `StringToPtr`), pointer conversion (`PtrToString`), logging (`LogError/Warn/Info/Debug/Trace`) |
+| `vela/pkg/common` | Request type constants (`Process`, `Deanonymize`, etc.) used for routing inside `process_request` |
+| `app` (local) | Application-specific business logic, state types, instruction types, event types |
 
 
 ### Makefile
@@ -92,29 +91,31 @@ All application state is serialized to JSON, encrypted by the Executor (AES-256)
 ```go
 // ApplicationInternalState is the root state container.
 type ApplicationInternalState struct {
-    AppID    int64                    `json:"appId"`
+    AppID    uint64                   `json:"appId"`
     Accounts map[string]*AccountState `json:"accounts"`
     Nonce    uint64                   `json:"nonce"`
 }
 
 // AccountState represents a single user account.
 type AccountState struct {
-    Address Address  `json:"address"`
-    Balance *Uint256 `json:"balance"`
+    Address types.Address  `json:"address"`
+    Balance *types.Uint256 `json:"balance"`
 }
 ```
 
 Design choices:
 - **Accounts keyed by hex string** (e.g., `"0xadd...01"`). This avoids issues with binary map keys in JSON serialization.
 - **Global nonce** incremented on every state-changing operation. Included in events so clients can verify ordering.
-- **`Uint256`** for balances — a custom 256-bit unsigned integer (`[4]uint64`) that matches Ethereum's native precision. Supports `Add`, `Sub`, `Cmp`, `AddOverflow`, and `IsZero`. This is a local implementation because TinyGo does not support `math/big`.
-- **`Address`** — a local `[20]byte` type, not `go-ethereum`'s `common.Address`. JSON serialization produces the same `"0x..."` format, ensuring compatibility with the host.
+- **`types.Uint256`** for balances — provided by `vela-common-go/wasm/types`. A 256-bit unsigned integer (`[4]uint64`) that matches Ethereum's native precision. Supports `Add`, `Sub`, `Cmp`, `AddOverflow`, and `IsZero`.
+- **`types.Address`** — provided by `vela-common-go/wasm/types`. A `[20]byte` type (not `go-ethereum`'s `common.Address`). JSON serialization produces the same `"0x..."` format, ensuring compatibility with the host.
 
 ---
 
 ## Step 3: Implement the WASM Exports
 
-Your module must export these functions: `load_module`, `deposit`, `process_request`, `generate_deanonymization_report`, plus `allocate`/`deallocate` (implemented in `utils/`).
+Your module must export these functions: `load_module`, `deposit`, `process_request`, plus `allocate`/`deallocate` (provided by `vela-common-go/wasm/utils`).
+
+> **Change from v0.0.18**: The `generate_deanonymization_report` export has been removed. Deanonymization is now handled inside `process_request` via the new `requestType` parameter.
 
 ### main.go — The Bridge Layer
 
@@ -122,56 +123,57 @@ Your module must export these functions: `load_module`, `deposit`, `process_requ
 package main
 
 import (
-    "github.com/horizen-pes-nova/payment-app/app"
-    "github.com/horizen-pes-nova/payment-app/utils"
+    "github.com/HorizenOfficial/vela-common-go/wasm/types"
+    "github.com/HorizenOfficial/vela-common-go/wasm/utils"
+    "github.com/HorizenOfficial/vela-nova/payment-app/app"
 )
 
 //export load_module
 func load_module(appId int64) *byte {
     result := app.LoadModule(appId)
-    return app.SerializeAndWriteResult(result)
+    return types.SerializeAndWriteResult(result)
 }
 
 //export deposit
 func deposit(appId int64, senderPtr *byte, senderLen int32,
              valuePtr *byte, valueLen int32,
              statePtr *byte, stateLen int32) *byte {
-    sender := app.PtrToAddress(senderPtr, senderLen)
-    value := app.PtrToUint256(valuePtr, valueLen)
+    _ = appId
+    sender := types.PtrToAddress(senderPtr, senderLen)
     stateJSON := utils.PtrToString(statePtr, stateLen)
+    value := types.PtrToUint256(valuePtr, valueLen)
     result := app.DepositFunds(sender, value, stateJSON)
-    return app.SerializeAndWriteResult(result)
+    return types.SerializeAndWriteResult(result)
 }
 
 //export process_request
 func process_request(appId int64, senderPtr *byte, senderLen int32,
+                     requestType int32,
                      payloadPtr *byte, payloadLen int32,
                      statePtr *byte, stateLen int32) *byte {
-    sender := app.PtrToAddress(senderPtr, senderLen)
+    _ = appId
+    sender := types.PtrToAddress(senderPtr, senderLen)
     payloadJSON := utils.PtrToString(payloadPtr, payloadLen)
     stateJSON := utils.PtrToString(statePtr, stateLen)
-    result := app.ProcessRequest(sender, payloadJSON, stateJSON)
-    return app.SerializeAndWriteResult(result)
+    result := app.ProcessRequest(sender, requestType, payloadJSON, stateJSON)
+    return types.SerializeAndWriteResult(result)
 }
 
-//export generate_deanonymization_report
-func generate_deanonymization_report(payloadPtr *byte, payloadLen int32,
-                                     statePtr *byte, stateLen int32) *byte {
-    payloadJSON := utils.PtrToString(payloadPtr, payloadLen)
-    stateJSON := utils.PtrToString(statePtr, stateLen)
-    result := app.GenerateDeanonymizationReport(payloadJSON, stateJSON)
-    return app.SerializeAndWriteResult(result)
+//export get_memory_stats
+func get_memory_stats() *byte {
+    result := app.GetAllocatedMemoryStats()
+    return types.SerializeAndWriteResult(result)
 }
 
 func main() {} // Required by Go, not used in WASM
 ```
 
 Key patterns:
-- Use `app.PtrToAddress`, `app.PtrToUint256`, `utils.PtrToString` to convert WASM pointers into Go types.
-- Always return via `app.SerializeAndWriteResult(result)` — this serializes your result to JSON and writes it into WASM linear memory for the host to read (4-byte little-endian length prefix + data).
+- Use `types.PtrToAddress`, `types.PtrToUint256`, `utils.PtrToString` to convert WASM pointers into Go types. These are now imported from `vela-common-go`.
+- Always return via `types.SerializeAndWriteResult(result)` — this serializes your result to JSON and writes it into WASM linear memory for the host to read (4-byte little-endian length prefix + data).
 - The `//export` directive is required for TinyGo to expose the function to the host.
-- **`process_request` does not receive a `requestType` parameter** — the Executor routes requests by type and calls the appropriate export directly. Only `PROCESS` requests go through `process_request`.
-- **`generate_deanonymization_report` is a separate export** with no `appId` or `sender` parameters.
+- **`process_request` receives a `requestType int32` parameter** — the app uses this to determine the operation (e.g., standard processing vs. deanonymization). Both `PROCESS` and `DEANONYMIZATION` requests go through this single export.
+- **`ASSOCIATEKEY` requests** are handled entirely by the Executor and never reach the WASM module.
 
 ---
 
@@ -182,20 +184,20 @@ Key patterns:
 Called once when the application is deployed on-chain. Returns the initial empty state.
 
 ```go
-func LoadModule(appId int64) LoadModuleResult {
+func LoadModule(appId int64) types.LoadModuleResult {
     initialState := &ApplicationInternalState{
-        AppID:    appId,
+        AppID:    uint64(appId),
         Accounts: make(map[string]*AccountState),
     }
     stateJSON, err := json.Marshal(initialState)
     if err != nil {
-        return LoadModuleResult{
+        return types.LoadModuleResult{
             Error: fmt.Sprintf("failed to marshal initial state: %v", err),
         }
     }
-    return LoadModuleResult{
+    return types.LoadModuleResult{
         State: stateJSON,
-        Fuel:  NewUint256(5),
+        Fuel:  types.NewUint256(5),
     }
 }
 ```
@@ -268,14 +270,14 @@ func DepositFunds(senderPtr *Address, value *Uint256, stateJSON string) DepositR
 }
 ```
 
-### ProcessRequest — Transfers and Withdrawals
+### ProcessRequest — Transfers, Withdrawals, and Deanonymization
 
-This is the main entry point for `PROCESS` requests. The operation type is determined by the payload's `type` field. Deanonymization is handled by a separate export (`generate_deanonymization_report`).
+This is the main entry point for `PROCESS` and `DEANONYMIZATION` requests. The `requestType` parameter (passed by the Executor) takes precedence: when it equals `Deanonymize` (value 2), the app generates a report regardless of the payload. For standard requests, the operation type is determined by the payload's `type` field.
 
 ```go
-func ProcessRequest(senderPtr *Address, payloadJSON, stateJSON string) ProcessResult {
+func ProcessRequest(senderPtr *types.Address, requestType int32, payloadJSON, stateJSON string) types.ProcessResult {
     if senderPtr == nil {
-        return ProcessResult{Error: "Sender address is missing"}
+        return types.ProcessResult{Error: "Sender address is missing"}
     }
 
     sender := *senderPtr
@@ -284,45 +286,55 @@ func ProcessRequest(senderPtr *Address, payloadJSON, stateJSON string) ProcessRe
     // Parse state
     var currentState ApplicationInternalState
     if err := json.Unmarshal([]byte(stateJSON), &currentState); err != nil {
-        return ProcessResult{Error: fmt.Sprintf("Failed to parse application state: %v", err)}
+        return types.ProcessResult{Error: fmt.Sprintf("Failed to parse application state: %v", err)}
     }
 
-    var events []PlainEvent
-    var withdrawals []Withdrawal
+    var events []types.PlainEvent
+    var withdrawals []types.Withdrawal
+    var instructions PayloadInstructions
 
-    if payloadJSON != "" {
-        var instructions PayloadInstructions
+    // Parse payload if present
+    if payloadJSON != "" && payloadJSON != "{}" {
         if err := json.Unmarshal([]byte(payloadJSON), &instructions); err != nil {
-            return ProcessResult{Error: fmt.Sprintf("Failed to parse payload instructions: %v", err)}
+            return types.ProcessResult{Error: fmt.Sprintf("Failed to parse payload instructions: %v", err)}
         }
+    }
 
-        switch instructions.Type {
-        case "transfer":  // ...
-        case "withdraw":  // ...
-        default:
-            return ProcessResult{Error: fmt.Sprintf("Unsupported instruction type: [%s]", instructions.Type)}
-        }
+    // requestType takes precedence over payload type
+    var instructionType string
+    if requestType == int32(common.Deanonymize) {
+        instructionType = "deanonymize"
+    } else {
+        instructionType = instructions.Type
+    }
+
+    switch instructionType {
+    case "transfer":       // ...
+    case "withdraw":       // ...
+    case "deanonymize":    // generate report and return early
+    default:
+        return types.ProcessResult{Error: fmt.Sprintf("Unsupported instruction type: [%s]", instructionType)}
     }
 
     newStateBytes, _ := json.Marshal(currentState)
-    return ProcessResult{
-        State: newStateBytes, Events: events, Withdrawals: withdrawals, Fuel: NewUint256(50),
+    return types.ProcessResult{
+        State: newStateBytes, Events: events, Withdrawals: withdrawals, Fuel: types.NewUint256(50),
     }
 }
 ```
 
 #### Transfer
 
-Moves funds between two accounts within the app. Both sender and recipient receive encrypted events.
+Moves funds between two accounts within the app. Both sender and recipient receive encrypted events. Transfers support an optional `InvoiceID` field (max 100 characters) for payment tracking.
 
 ```go
 case "transfer":
     // Validate sender has sufficient balance
     if currentState.Accounts[senderHex] == nil {
-        return ProcessResult{Error: fmt.Sprintf("Account %s does not exist!", senderHex)}
+        return types.ProcessResult{Error: fmt.Sprintf("Account %s does not exist!", senderHex)}
     }
     if currentState.Accounts[senderHex].Balance.Cmp(*instructions.Transfer.Amount) < 0 {
-        return ProcessResult{Error: "Insufficient balance for transfer"}
+        return types.ProcessResult{Error: "Insufficient balance for transfer"}
     }
 
     recipientHex := instructions.Transfer.To.Hex()
@@ -331,21 +343,29 @@ case "transfer":
     if currentState.Accounts[recipientHex] == nil {
         currentState.Accounts[recipientHex] = &AccountState{
             Address: instructions.Transfer.To,
-            Balance: NewUint256(0),
+            Balance: types.NewUint256(0),
         }
     }
 
-    // Execute transfer
+    // Execute transfer (save balances for revert on overflow)
+    oldSenderBalance := *currentState.Accounts[senderHex].Balance
+    oldRecipientBalance := *currentState.Accounts[recipientHex].Balance
+
     currentState.Accounts[senderHex].Balance.Sub(
         *currentState.Accounts[senderHex].Balance, *instructions.Transfer.Amount)
-    currentState.Accounts[recipientHex].Balance.Add(
-        *currentState.Accounts[recipientHex].Balance, *instructions.Transfer.Amount)
+    if currentState.Accounts[recipientHex].Balance.AddOverflow(
+        *currentState.Accounts[recipientHex].Balance, *instructions.Transfer.Amount) {
+        // Revert both balances on overflow
+        *currentState.Accounts[senderHex].Balance = oldSenderBalance
+        *currentState.Accounts[recipientHex].Balance = oldRecipientBalance
+        return types.ProcessResult{Error: "Overflow while adding transfer amount"}
+    }
     currentState.Nonce++
 
-    // Two events: one for sender, one for recipient
+    // Two events: one for sender, one for recipient (InvoiceID included if present)
     events = append(events,
-        PlainEvent{UserID: sender, EventSubType: "transfer_sent", Data: ...},
-        PlainEvent{UserID: instructions.Transfer.To, EventSubType: "transfer_received", Data: ...},
+        types.PlainEvent{UserID: sender, EventSubType: "transfer_sent", Data: ...},
+        types.PlainEvent{UserID: instructions.Transfer.To, EventSubType: "transfer_received", Data: ...},
     )
 ```
 
@@ -383,40 +403,35 @@ case "withdraw":
 
 `Withdrawal` entries are included in the signed update payload. The smart contract verifies the TEE signature and credits the destination address via pull-payment.
 
-### GenerateDeanonymizationReport — Separate Export
+#### Deanonymization (inside ProcessRequest)
 
-This is a dedicated WASM export, **not** handled through `process_request`. The Executor calls it directly when the request type is `DEANONYMIZATION`. It does **not** modify state and returns a `DeanonymizationResult` (not a `ProcessResult`).
+When `requestType == common.Deanonymize`, the app generates a report and returns it in `ProcessResult.Report`. The state is **not modified** — the original state JSON is returned as-is to avoid unnecessary marshalling.
 
 ```go
-func GenerateDeanonymizationReport(payloadJSON, stateJSON string) DeanonymizationResult {
-    var payload ReportPayloadInstructions
-    if err := json.Unmarshal([]byte(payloadJSON), &payload); err != nil {
-        return DeanonymizationResult{Error: fmt.Sprintf("Failed to parse payload: %s, err: %v",
-            payloadJSON, err)}
-    }
-
-    var currentState ApplicationInternalState
-    if err := json.Unmarshal([]byte(stateJSON), &currentState); err != nil {
-        return DeanonymizationResult{Error: fmt.Sprintf("Failed to parse application state: %v", err)}
-    }
-
-    report := UnencryptedDeanonymizationReportData{
+case "deanonymize":
+    report := DeanonymizationReport{
         Accounts: currentState.Accounts,
         Nonce:    currentState.Nonce,
     }
-    reportBytes, _ := json.Marshal(report)
+    reportBytes, err := json.Marshal(report)
+    if err != nil {
+        return types.ProcessResult{Error: fmt.Sprintf("Failed to serialize deanonymization report: %v", err)}
+    }
 
-    return DeanonymizationResult{Report: reportBytes, Fuel: NewUint256(20)}
-}
+    return types.ProcessResult{
+        State:  []byte(stateJSON), // no state modification, reuse original
+        Report: reportBytes,
+        Fuel:   types.NewUint256(20),
+    }
 ```
 
-The Executor encrypts the report with the requesting authority's P-521 public key. Only authorized auditors (registered in the `AuthorityRegistry` contract) can submit deanonymization requests.
+The Executor validates that the `Report` field is populated for deanonymization requests (and empty for non-deanonymization requests). It encrypts the report with the requesting authority's P-521 public key. Only authorized auditors (registered in the `AuthorityRegistry` contract) can submit deanonymization requests.
 
 ---
 
 ## Step 5: Payload Format
 
-Users submit encrypted JSON payloads. After decryption, the Executor passes them to `process_request`. 
+Users submit encrypted JSON payloads. After decryption, the Executor passes them to `process_request`.
 Every app must define its own payloads.
 Here are the payload formats your app defines:
 
@@ -426,10 +441,12 @@ Here are the payload formats your app defines:
   "type": "transfer",
   "transfer": {
     "to": "0x1234567890abcdef1234567890abcdef12345678",
-    "amount": "0x6f05b59d3b20000"
+    "amount": "0x6f05b59d3b20000",
+    "invoice_id": "INV-2025-001"
   }
 }
 ```
+The `invoice_id` field is optional (max 100 characters). It is included in both sender and recipient events for payment tracking.
 
 **Withdrawal:**
 ```json
@@ -442,17 +459,17 @@ Here are the payload formats your app defines:
 }
 ```
 
-**Deanonymization (passed to `generate_deanonymization_report`):**
+**Deanonymization:**
 ```json
 {}
 ```
-For deanonymization, the payload is an empty JSON object. The Executor calls the dedicated `generate_deanonymization_report()` export directly — the request type routing is handled by the Executor, not the payload.
+For deanonymization, the payload can be an empty JSON object. The `requestType` parameter (set by the Executor to `2`) determines the routing — the app checks `requestType == common.Deanonymize` and generates a report regardless of payload content.
 
 ---
 
 ## Step 6: Events
 
-Events are the only way to communicate results back to users. 
+Events are the only way to communicate results back to users.
 Each event targets a specific user and is encrypted with their registered P-521 key.
 
 Every app must define its own event. <br>
@@ -463,8 +480,8 @@ Here are the payload formats your app defines:
 | EventSubType | Recipient | Data Fields |
 |--------------|-----------|-------------|
 | `deposit` | Depositor | `type`, `amount`, `balance`, `nonce` |
-| `transfer_sent` | Sender | `type`, `to`, `amount`, `balance`, `nonce` |
-| `transfer_received` | Recipient | `type`, `from`, `amount`, `balance`, `nonce` |
+| `transfer_sent` | Sender | `type`, `to`, `amount`, `balance`, `nonce`, `invoice_id` (optional) |
+| `transfer_received` | Recipient | `type`, `from`, `amount`, `balance`, `nonce`, `invoice_id` (optional) |
 | `withdrawal` | Withdrawer | `type`, `to`, `amount`, `balance`, `nonce` |
 
 ### Emitting an Event
@@ -490,14 +507,14 @@ events = append(events, PlainEvent{
 
 ## Step 7: Fuel
 
-Every operation must return a `Fuel` value representing computation cost. The fee charged to the user is `fuel * weiPerFuelUnit` (configured on-chain). Any remaining deposit is refunded.
+Every operation must return a `Fuel` value representing computation cost. The fee charged to the user is `fuel * weiPerFuelUnit` (configured on-chain). Any remaining deposit is refunded. A minimum fee per request (`MIN_FEE_PER_REQUEST`) is enforced at the contract level.
 
 | Operation | Fuel |
 |-----------|------|
 | `LoadModule` | 5 |
 | `Deposit` | 35 |
 | `ProcessRequest` (transfer or withdraw) | 50 |
-| `GenerateDeanonymizationReport` | 20 |
+| `ProcessRequest` (deanonymize) | 20 |
 
 Fuel values are application-defined. Set them proportional to the computational cost of each operation.
 
@@ -543,21 +560,59 @@ Since your code compiles with TinyGo (not standard Go), keep these limitations i
 | **Stateless execution** | No global mutable state between invocations; everything goes through the state parameter |
 | **JSON serialization** | `encoding/json` works. Keep state structures simple |
 | **Logging** | Use `utils.LogError/Warn/Info/Debug/Trace` — writes to stdout with level prefixes (ERR/WRN/INF/DBG/TRC), captured by host via WASI pipe |
-| **Memory** | `allocate`/`deallocate` must be implemented in your `utils` package — they are auto-exported by TinyGo |
-| **Local types** | Define your own `Address` (`[20]byte`), `Uint256` (`[4]uint64`), etc. — do not import from the host |
+| **Memory** | `allocate`/`deallocate` are provided by `vela-common-go/wasm/utils` — auto-exported by TinyGo |
+| **Shared types** | Use `Address`, `Uint256`, etc. from `vela-common-go/wasm/types` — do not import from the host (`go-ethereum`) |
+
+---
+
+## Local Development Setup
+
+To test this app with the local dev environment:
+
+1. Download `payment_app.wasm` from https://github.com/HorizenOfficial/vela-nova/releases/tag/v0.0.25
+2. Copy it into `dockerfiles/wasms/` and rename to `1.wasm`
+3. Start the environment: `cd dockerfiles && cp .env.dev .env && docker compose up`
+4. Download the `nova-linux` wallet from the same release page
+5. Configure `wallet.conf` (from `wallet.conf.template`):
+    ```
+    rpcUrl=http://localhost:8545
+    ProcessorAddress=0xCf7Ed3AccA5a467e9e704C703E8D87F634fB0Fc9
+    TeeAuthenticatorAddress=0x9fE46736679d2D9a65F0992F2272dE9f3c7fa6e0
+    AuthorityServiceURL=http://localhost:8081
+    SubgraphURL=http://localhost:8000/subgraphs/name/hcce
+    ```
+6. Set wallet keys:
+    - `keySecp256k1`: use an Anvil default private key (accounts are pre-funded with 1000 ETH)
+    - `keyP521`: generate with `./nova-linux generatekeys`
+7. Deploy and interact:
+    ```bash
+    ./nova-linux deployapp 1
+    ./nova-linux registeruser
+    ./nova-linux getpublicbalance
+    ./nova-linux deposit -a "1 ETH"
+    ./nova-linux getprivatebalance
+    ```
 
 ---
 
 ## Summary
 
-Building an application on Horizen CCE comes down to:
+Building an application on Vela CCE comes down to:
 
 1. **Define your state** — a JSON-serializable struct that holds all application data.
-2. **Define local types** — `Address`, `Uint256`, `PlainEvent`, `Withdrawal`, and result types compatible with the host's JSON format.
-3. **Implement four exports** — `load_module` (init), `deposit` (fund accounts), `process_request` (transfers, withdrawals), `generate_deanonymization_report` (auditing).
-4. **Implement memory management** — `allocate`/`deallocate` in a `utils` package for WASM memory exchange.
-5. **Return results** — updated state, events for users, withdrawals for on-chain transfers, and fuel for fee calculation.
+2. **Import shared types** — use `Address`, `Uint256`, `PlainEvent`, `Withdrawal`, and result types from `vela-common-go/wasm/types`.
+3. **Implement three exports** — `load_module` (init), `deposit` (fund accounts), `process_request` (transfers, withdrawals, and deanonymization via `requestType` routing).
+4. **Memory management** — `allocate`/`deallocate` are provided by `vela-common-go/wasm/utils`.
+5. **Return results** — updated state, events for users, withdrawals for on-chain transfers, fuel for fee calculation, and optional report for deanonymization.
 6. **Handle errors** — return early with an `Error` string; never leave state partially modified.
 7. **Compile with TinyGo** — `tinygo build -target=wasi .`
 
 The Executor handles all cryptography (state encryption, event encryption, payload decryption, signing). Your app works with plaintext data and lets the platform handle the rest.
+
+### Related Resources
+
+| Resource | URL |
+|----------|-----|
+| Vela Nova (test app source) | https://github.com/HorizenOfficial/vela-nova/releases/tag/v0.0.25 |
+| Vela Common TS (browser client) | https://github.com/HorizenOfficial/vela-common-ts |
+| Local dev environment | `dockerfiles/` in this repository |

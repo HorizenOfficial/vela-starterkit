@@ -1,8 +1,8 @@
-# Horizen CCE - Architecture Summary
+# Vela - Architecture Summary (v0.0.25)
 
 ## 1. System Overview
 
-Horizen CCE is a platform that executes WebAssembly (WASM) modules inside AWS Nitro Enclaves (TEE), with encrypted state management and blockchain-based coordination. Users submit requests on-chain; the system processes them securely off-chain and posts signed results back to the blockchain.
+Vela  is a platform that executes WebAssembly (WASM) modules inside AWS Nitro Enclaves (TEE), with encrypted state management and blockchain-based coordination. Users submit requests on-chain; the system processes them securely off-chain and posts signed results back to the blockchain.
 
 ```
                                  ┌──────────────────────────────────┐
@@ -28,20 +28,26 @@ Horizen CCE is a platform that executes WebAssembly (WASM) modules inside AWS Ni
 │  │  (RPC)        │   │  (TCP/VSock)   │   │  - WASM bytecode       │  │
 │  └──────────────┘   └───────┬────────┘    │  - keyset recovery     │  │
 │                              │            └────────────────────────┘  │
+│  ┌──────────────────────────────────────────────────────────────────┐ │
+│  │  Log Server (centralized logging with optional file rotation)   │ │
+│  └──────────────────────────────────────────────────────────────────┘ │
+│  ┌──────────────────────────────────────────────────────────────────┐ │
+│  │  Admin Interface (MANAGER_ADMIN_PORT)                           │ │
+│  └──────────────────────────────────────────────────────────────────┘ │
 └──────────────────────────────┼────────────────────────────────────────┘
                                │ bidirectional messages
-                               │ (JSON over VSock)
+                               │ (JSON over VSock/TCP)
 ┌──────────────────────────────▼────────────────────────────────────────┐
 │                    WASM Executor (AWS Nitro Enclave)                  │
-│                                                                      │
-│  ┌──────────────┐   ┌───────────────────┐   ┌─────────────────────┐  │
+│                                                                       │
+│  ┌──────────────┐   ┌───────────────────┐   ┌─────────────────────┐   │
 │  │  Enclave      │   │  Wasmtime Runtime │   │  Crypto Operations  │  │
 │  │  KeySet       │   │  (WASM execution) │   │  - AES-256 state    │  │
 │  │  - AES state  │   │                   │   │  - P521 ECDH events │  │
 │  │  - secp256k1  │   │  ┌─────────────┐  │   │  - secp256k1 sign   │  │
 │  │    signing    │   │  │ WASM Guest  │  │   └─────────────────────┘  │
 │  │  - P521 comm  │   │  │ Application │  │                            │
-│  └──────────────┘   │  └─────────────┘  │                            │
+│  └──────────────┘   │  └─────────────┘  │                             │
 │                      └───────────────────┘                            │
 └───────────────────────────────────────────────────────────────────────┘
 ```
@@ -82,9 +88,8 @@ Events: `RequestSubmitted`, `RequestCompleted`, `StateRootUpdate`, `UserEvent` (
 
 #### TeeAuthenticator
 
-Manages TEE identity. Verifies AWS Nitro Enclave attestation documents against expected PCR0 values and registers the TEE's signing address and P521 public key.
+Manages TEE identity. Verifies AWS Nitro Enclave attestation documents against expected PCR0 values and registers the TEE's signing address and P521 public key. In development mode, a `NoAttestationTeeAuthenticator` variant is used to bypass Nitro attestation requirements.
 
-- **Single-step attestation** (`updateTee`): For small attestations.
 - **Multi-step attestation** (`updateTeeStep1`..`4`): Breaks large attestation verification across multiple transactions to fit gas limits.
 - **Signature verification** (`checkSignature`): Called by ProcessorEndpoint during `stateUpdate`. Recovers the signer from an ECDSA signature and verifies it matches the registered TEE address.
 
@@ -104,7 +109,9 @@ The Manager runs outside the enclave and orchestrates the entire execution flow.
 3. Initialize versioned LevelDB storage
 4. Connect to Executor (TCP or VSock)
 5. Complete keyset handshake with Executor
-6. Start polling loop
+6. Start log server (centralized log collection with optional file rotation)
+7. Start admin interface (if `MANAGER_ADMIN_PORT` is configured)
+8. Start polling loop
 
 **Main processing loop** (`pollBlockchain`):
 ```
@@ -133,6 +140,19 @@ every N seconds:
 - Retains last N versions for rollback on chain reorganization
 - Non-versioned storage for enclave keyset recovery data
 
+**Log server** (new in v0.0.25):
+- Centralized log collection from both Manager and Executor
+- Optional file rotation with configurable parameters:
+  - `LOG_SERVER_FILE_ROTATION` — enable/disable rotation
+  - `LOG_SERVER_FILE_MAX_SIZE_MB` — max size per file
+  - `LOG_SERVER_FILE_MAX_BACKUPS` — number of rotated files to keep
+  - `LOG_SERVER_FILE_MAX_AGE_DAYS` — max age before deletion
+  - `LOG_SERVER_FILE_COMPRESS` — compress rotated files
+
+**Admin interface** (new in v0.0.25):
+- Exposed on `MANAGER_ADMIN_PORT`
+- Configurable request timeout via `MANAGER_ADMIN_COMMUNICATION_PARAMS_REQUEST_TIMEOUT_SEC`
+
 ### 2.3 WASM Executor
 
 The Executor runs inside the AWS Nitro Enclave (TEE) and handles all cryptographic operations and WASM execution.
@@ -145,6 +165,13 @@ The Executor runs inside the AWS Nitro Enclave (TEE) and handles all cryptograph
 | `SigningKey` | secp256k1 | Sign update payloads (verified on-chain) |
 | `CommunicationKey` | P-521 (ECDH) | Encrypt events, payloads, and reports |
 
+**Keyset recovery** — controlled by `EXECUTOR_KEYSET_RECOVERY_TYPE`:
+
+| Value | Mode | Description |
+|-------|------|-------------|
+| `0` | Fixed keys | Use keys from environment variables (`EXECUTOR_FIXED_SIGNING_KEY`, `EXECUTOR_FIXED_COMMUNICATION_KEY`, `EXECUTOR_FIXED_STATE_KEY`). Used for local development. |
+| Other | Recovery handshake | Restore keys from encrypted recovery data stored by the Manager (production mode). |
+
 **Keyset handshake** (on connection):
 1. Executor asks Manager for stored recovery data
 2. If found: restore keys from encrypted recovery blob
@@ -156,10 +183,13 @@ The Executor runs inside the AWS Nitro Enclave (TEE) and handles all cryptograph
 2. Deserialize into AppData (state + user key store)
 3. If deposit: call WASM deposit()
 4. If AssociateKey: register sender's P521 public key
-5. If Deanonymize: decrypt payload (ECDH), call WASM generate_deanonymization_report()
-6. Otherwise: decrypt payload (ECDH), call WASM process_request()
-7. Encrypt new state (AES-256), compute state root (SHA256)
-8. Encrypt events using recipient P521 public keys (ECDH → AES-GCM)
+5. Otherwise (Process or Deanonymize):
+   - decrypt payload (ECDH)
+   - call WASM process_request() with requestType parameter
+   - the WASM app uses requestType to route internally
+6. Encrypt new state (AES-256), compute state root (SHA256)
+7. Encrypt events using recipient P521 public keys (ECDH → AES-GCM)
+8. If Deanonymize: validate that report data is present in the response
 9. Sign UpdatePayload with secp256k1 SigningKey
 10. Return: UpdatePayload + encrypted ApplicationState + optional DeanonymizationReport
 ```
@@ -230,13 +260,13 @@ Before a user can receive encrypted events or submit encrypted payloads, they re
 
 ### 3.4 Deanonymization
 
-An authorized authority submits a `DEANONYMIZATION` request. The Executor calls the WASM module's dedicated `generate_deanonymization_report()` export (separate from `process_request()`). The WASM application generates a report (e.g., all account balances). The Executor encrypts this report with the authority's P-521 public key. The Manager stores the encrypted report on the filesystem. The authority retrieves it via the Authority Service HTTP API (`GET /nonce` + `POST /getreport`).
+An authorized authority submits a `DEANONYMIZATION` request. The Executor passes the request to `process_request()` with `requestType = Deanonymize`. The WASM application uses the `requestType` parameter to determine that a deanonymization report is needed and returns the report data in the `ProcessResult.Report` field. The Executor validates that report data is present, encrypts it with the authority's P-521 public key, and stores it. The Manager stores the encrypted report on the filesystem. The authority retrieves it via the Authority Service HTTP API (`GET /nonce` + `POST /getreport`).
 
 ---
 
 ## 4. WASM Guest Interface
 
-To develop a new WASM application for Horizen PES, you implement a TinyGo program that exports specific functions, compile it to WASM with `tinygo build -target=wasi`, and deploy it on-chain.
+To develop a new WASM application for Vela CCE, you implement a TinyGo program that exports specific functions, compile it to WASM with `tinygo build -target=wasi`, and deploy it on-chain.
 
 ### 4.1 Required Exports
 
@@ -290,20 +320,21 @@ type DepositResult struct {
 }
 ```
 
-#### `process_request(appId: i64, senderPtr: *byte, senderLen: i32, payloadPtr: *byte, payloadLen: i32, statePtr: *byte, stateLen: i32) -> *byte`
+#### `process_request(appId: i64, senderPtr: *byte, senderLen: i32, requestType: i32, payloadPtr: *byte, payloadLen: i32, statePtr: *byte, stateLen: i32) -> *byte`
 
-Main processing function. Called for `PROCESS` requests. The Executor routes requests by type — only standard processing goes through this function (deanonymization has its own export, and `ASSOCIATEKEY` is handled by the Executor directly).
+Main processing function. Called for `PROCESS` and `DEANONYMIZATION` requests. The Executor passes the `requestType` parameter so the WASM app can route internally. `ASSOCIATEKEY` is handled entirely by the Executor and does not reach this function.
 
 ```go
 //export process_request
 func process_request(appId int64, senderPtr *byte, senderLen int32,
+                     requestType int32,
                      payloadPtr *byte, payloadLen int32,
                      statePtr *byte, stateLen int32) *byte {
-    sender  := myapp.PtrToAddress(senderPtr, senderLen)
+    sender  := types.PtrToAddress(senderPtr, senderLen)
     payload := utils.PtrToString(payloadPtr, payloadLen)
     state   := utils.PtrToString(statePtr, stateLen)
-    result  := myapp.ProcessRequest(sender, payload, state)
-    return myapp.SerializeAndWriteResult(result)
+    result  := myapp.ProcessRequest(sender, requestType, payload, state)
+    return types.SerializeAndWriteResult(result)
 }
 ```
 
@@ -313,34 +344,13 @@ type ProcessResult struct {
     State       []byte       `json:"state"`              // Updated state
     Events      []PlainEvent `json:"events"`              // Emitted events
     Withdrawals []Withdrawal `json:"withdrawals"`         // Fund transfers
+    Report      []byte       `json:"report,omitempty"`    // Deanonymization report (only for DEANONYMIZATION requests)
     Fuel        *Uint256     `json:"fuel"`                // Fuel consumed
     Error       string       `json:"error,omitempty"`
 }
 ```
 
-#### `generate_deanonymization_report(payloadPtr: *byte, payloadLen: i32, statePtr: *byte, stateLen: i32) -> *byte`
-
-Called when the Executor receives a `DEANONYMIZATION` request. This is a separate export from `process_request`. Note: no `appId` or `sender` parameters — the Executor handles authorization.
-
-```go
-//export generate_deanonymization_report
-func generate_deanonymization_report(payloadPtr *byte, payloadLen int32,
-                                     statePtr *byte, stateLen int32) *byte {
-    payload := utils.PtrToString(payloadPtr, payloadLen)
-    state   := utils.PtrToString(statePtr, stateLen)
-    result  := myapp.GenerateDeanonymizationReport(payload, state)
-    return myapp.SerializeAndWriteResult(result)
-}
-```
-
-Returns `DeanonymizationResult`:
-```go
-type DeanonymizationResult struct {
-    Report []byte   `json:"report"`            // Encrypted report data
-    Fuel   *Uint256 `json:"fuel"`              // Fuel consumed
-    Error  string   `json:"error,omitempty"`
-}
-```
+When `requestType` is `DEANONYMIZATION` (value 2), the application **must** populate the `Report` field. The Executor validates this: if the request is a deanonymization but `Report` is empty, or if `Report` is non-empty for a non-deanonymization request, the Executor returns an error.
 
 #### `allocate` and `deallocate`
 
@@ -362,9 +372,11 @@ Returns memory allocation statistics. Useful for debugging.
 
 ### 4.2 Types
 
-The WASM guest module defines its own types locally (not imported from the host). This is a deliberate design choice: the guest is a separate sandboxed environment compiled with TinyGo, which cannot import host packages (e.g., `go-ethereum`). Communication between host and guest happens via JSON serialization — both sides define compatible types independently.
+In v0.0.25, common WASM types are provided by the shared library `github.com/HorizenOfficial/vela-common-go/wasm/types`. This library defines the core types (`Address`, `Uint256`, `PlainEvent`, `Withdrawal`, result structs) and helper functions (`SerializeAndWriteResult`, `PtrToAddress`, `PtrToUint256`). The utility functions (`PtrToString`, `StringToPtr`, logging) are in `vela-common-go/wasm/utils`.
 
-**Core types** (defined in the guest `app` package):
+The WASM guest module still communicates with the host via JSON serialization — both sides define compatible types independently. The guest cannot import host packages (e.g., `go-ethereum`), but it now shares type definitions with other WASM applications through the common library.
+
+**Core types** (defined in `vela-common-go/wasm/types`):
 
 | Type | Description |
 |------|-------------|
@@ -373,7 +385,7 @@ The WASM guest module defines its own types locally (not imported from the host)
 | `PlainEvent` | Event to emit: `UserID` (Address), `EventSubType` (string), `Data` ([]byte). |
 | `Withdrawal` | Withdrawal instruction: `DestinationAddress` (Address), `Amount` (*Uint256). |
 
-**Helper functions** (defined in the guest `app` package):
+**Helper functions** (defined in `vela-common-go/wasm/types`):
 
 | Function | Description |
 |----------|-------------|
@@ -381,7 +393,7 @@ The WASM guest module defines its own types locally (not imported from the host)
 | `PtrToAddress(ptr, len)` | Convert WASM pointer to `*Address` |
 | `PtrToUint256(ptr, len)` | Convert WASM pointer to `*Uint256` |
 
-**Utility functions** (defined in the guest `utils` package):
+**Utility functions** (defined in `vela-common-go/wasm/utils`):
 
 | Function | Description |
 |----------|-------------|
@@ -396,11 +408,11 @@ The Executor routes requests by type to the appropriate WASM export:
 | Value | Type | WASM Export Called |
 |-------|------|-------------------|
 | 0 | `DEPLOYAPP` | `load_module` |
-| 1 | `PROCESS` | `deposit` (if funds included) + `process_request` |
-| 2 | `DEANONYMIZATION` | `generate_deanonymization_report` |
+| 1 | `PROCESS` | `deposit` (if funds included) + `process_request(requestType=1)` |
+| 2 | `DEANONYMIZATION` | `process_request(requestType=2)` — app returns report in `ProcessResult.Report` |
 | 3 | `ASSOCIATEKEY` | None (handled entirely by the Executor) |
 
-Note: the `requestType` is **not** passed to the WASM module. The Executor determines which export to call based on the request type and invokes the correct function directly.
+The `requestType` is passed to `process_request` as an `int32` parameter. The WASM application uses it to determine which logic to execute (e.g., standard processing vs. deanonymization report generation). This is a change from earlier versions where deanonymization had a separate WASM export.
 
 ### 4.4 State Management
 
@@ -426,12 +438,11 @@ Return `Withdrawal` entries to transfer funds from the contract to a destination
 
 ### 4.7 Fuel
 
-Each operation must return a `Fuel` value representing computation cost. Fuel is priced at a configurable Wei-per-unit rate. The total fee (fuel cost) plus refund must equal the user's `maxFeeValue`.
+Each operation must return a `Fuel` value representing computation cost. Fuel is priced at a configurable Wei-per-unit rate. The total fee (fuel cost) plus refund must equal the user's `maxFeeValue`. A minimum fee per request (`MIN_FEE_PER_REQUEST`) is enforced at the contract level.
 
 ### 4.8 Deanonymization Reports
 
-When the request type is `DEANONYMIZATION`, the Executor calls the dedicated `generate_deanonymization_report()` export (not `process_request()`). The application **must** return a non-nil `Report` in the `DeanonymizationResult`. The Executor encrypts this report with the requesting authority's P-521 public key. The authority retrieves it via the Authority Service.
-
+When the request type is `DEANONYMIZATION` (value 2), the Executor calls `process_request()` with `requestType=2`. The application **must** populate the `Report` field in the returned `ProcessResult`. The Executor validates that report data is present and encrypts it with the requesting authority's P-521 public key. The authority retrieves it via the Authority Service.
 
 ### 4.9 Application-side Constraints
 
@@ -469,10 +480,123 @@ When the request type is `DEANONYMIZATION`, the Executor calls the dedicated `ge
 
 ### Keyset Recovery
 
-On Executor restart, the handshake protocol recovers the keyset from encrypted recovery data stored by the Manager. This ensures the same signing address and encryption keys are used across restarts, maintaining continuity with on-chain identity.
+On Executor restart, the keyset recovery mechanism (controlled by `EXECUTOR_KEYSET_RECOVERY_TYPE`) restores the keyset. In production, the handshake protocol recovers the keyset from encrypted recovery data stored by the Manager. In development, fixed keys from environment variables are used. This ensures the same signing address and encryption keys are used across restarts, maintaining continuity with on-chain identity.
 
 ### Error Handling
 
 - **Transient errors** (WASM failure, invalid payload): Mark request failed on-chain, refund user, continue polling.
 - **Fatal errors** (storage corruption, unrecoverable state mismatch): Shutdown for manual intervention.
 - **Blockchain submission errors**: Detect reorg vs. permanent failure; rollback or mark failed accordingly.
+
+---
+
+## 7. Deployment Architecture (Docker Compose)
+
+The local development environment runs the full stack via Docker Compose. All images use the `v0.0.25` tag.
+
+### 7.1 Services
+
+| Service | Image | Purpose |
+|---------|-------|---------|
+| `executor` | `horizen/cce-executor:v0.0.25` | WASM execution inside emulated TEE |
+| `manager` | `horizen/cce-manager:v0.0.25` | Orchestration, blockchain polling, state storage |
+| `authorityservice` | `horizen/cce-authorityservice:v0.0.25` | Deanonymization report retrieval API |
+| `chain` | `horizen/cce-chain:v0.0.25` | Anvil dev chain (Foundry) |
+| `deployer` | `horizen/cce-deployer:v0.0.25` | Smart contract deployment (runs once) |
+| `subgraph-deployer` | `horizen/cce-subgraph-deployer:v0.0.25` | Subgraph deployment (runs once) |
+| `subgraph-node` | `graphprotocol/graph-node` | The Graph indexing |
+| `subgraph-postgres` | `postgres:14` | Graph Node database |
+| `subgraph-ipfs` | `ipfs/kubo:v0.17.0` | IPFS for subgraph storage |
+
+### 7.2 Networking
+
+Services communicate over an internal Docker network (`pes_network`) with fixed IP addresses:
+
+| Service | IP Address |
+|---------|------------|
+| Executor | `EXECUTOR_IP_HOST` (default: `10.10.40.10`) |
+| Manager | `MANAGER_IP_HOST` (default: `10.10.40.20`) |
+| Chain | `CHAIN_RPC_ADDRESS` (default: `10.10.40.30`) |
+| Authority Service | `AUTHORITY_SERVICE_IP_ADDRESS` (default: `10.10.40.40`) |
+
+Only the chain RPC (port 8545), authority service (port 8081), and subgraph query endpoint (port 8000) are exposed to the host.
+
+### 7.3 Volumes
+
+| Volume | Purpose |
+|--------|---------|
+| `vela-skit-manager-data` | Manager LevelDB (versioned state) |
+| `vela-skit-manager-reports` | Deanonymization reports (shared with authority service) |
+| `vela-skit-chain-data` | Anvil blockchain data |
+| `vela-skit-logs` | Centralized log files |
+| `vela-skit-deploy-data` | Deployed contract addresses (shared across services) |
+| `vela-skit-subgraph-postgres` | Graph Node PostgreSQL data |
+| `vela-skit-subgraph-ipfs` | Graph Node IPFS data |
+
+### 7.4 Startup Sequence
+
+1. **chain** (Anvil) starts and becomes available
+2. **subgraph-postgres**, **subgraph-ipfs** start (Graph Node infrastructure)
+3. **deployer** connects to the chain, deploys all smart contracts, writes deployed addresses to `vela-skit-deploy-data`, and exits
+4. **subgraph-node** starts, connects to the chain, and becomes healthy
+5. **subgraph-deployer** reads deployed contract addresses, generates a local subgraph manifest, deploys the subgraph, and exits
+6. **executor** starts and waits for Manager connection
+7. **manager** starts, reads deployed contract addresses, connects to the Executor, performs keyset handshake, and begins polling
+8. **authorityservice** starts, reads deployed contract addresses, connects to the subgraph
+
+---
+
+## 8. Configuration Reference
+
+### 8.1 Executor Environment Variables
+
+| Variable | Description |
+|----------|-------------|
+| `CHANNEL_TYPE` | Communication channel: `tcp` (Docker) or `vsock` (Nitro Enclave) |
+| `EXECUTOR_IP_HOST` | Executor IP address (used when `CHANNEL_TYPE=tcp`) |
+| `EXECUTOR_PORT` | Executor listening port |
+| `EXECUTOR_KEYSET_RECOVERY_TYPE` | Keyset recovery mode: `0` = fixed keys from env vars |
+| `EXECUTOR_FIXED_SIGNING_KEY` | secp256k1 private key (dev mode only) |
+| `EXECUTOR_FIXED_COMMUNICATION_KEY` | P-521 private key (dev mode only) |
+| `EXECUTOR_FIXED_STATE_KEY` | AES-256 key (dev mode only) |
+| `EXECUTOR_FUEL_PRICE_PER_UNIT` | Wei per fuel unit |
+| `EXECUTOR_MIN_FEE_PER_REQUEST` | Minimum fee enforced per request |
+| `EXECUTOR_COMMUNICATION_PARAMS_REQUEST_TIMEOUT_SEC` | Executor-side request timeout |
+| `LOG_SERVER_IP_HOST` | Log server IP (points to Manager) |
+| `EXECUTOR_LOG_*` | Logging configuration (kind, console, file, level, color) |
+
+### 8.2 Manager Environment Variables
+
+| Variable | Description |
+|----------|-------------|
+| `MANAGER_IP_HOST` | Manager IP address |
+| `MANAGER_ADMIN_PORT` | Admin interface port |
+| `MANAGER_KEY_SECP256` | Manager's secp256k1 private key for blockchain transactions |
+| `MANAGER_DATA_FOLDER` | Path for LevelDB storage (default: `/data`) |
+| `MANAGER_REPORTS_FOLDER` | Path for deanonymization reports (default: `/reports`) |
+| `MANAGER_INPUT_WASMS` | Path for WASM input files |
+| `MANAGER_ADMIN_COMMUNICATION_PARAMS_REQUEST_TIMEOUT_SEC` | Admin request timeout |
+| `MANAGER_COMMUNICATION_PARAMS_REQUEST_TIMEOUT_SEC` | Executor communication timeout |
+| `BLOCKCHAIN_POLLING_INTERVAL` | Seconds between blockchain polls |
+| `REORG_TIMEOUT` | Wait time for chain reorganization stabilization |
+| `HANDSHAKE_TIMEOUT` | Keyset handshake timeout |
+| `CHAIN_RPC_PROTOCOL` | RPC protocol (`http` or `https`) |
+| `CHAIN_RPC_ADDRESS` | Chain RPC IP address |
+| `CHAIN_RPC_PORT` | Chain RPC port |
+| `CHAIN_PROCESSOR_ADDRESS` | ProcessorEndpoint contract address |
+| `CHAIN_TEEAUTHENTICATOR_ADDRESS` | TeeAuthenticator contract address |
+| `MANAGER_LOG_*` | Logging configuration |
+| `LOG_SERVER_*` | Log server configuration (including file rotation) |
+
+### 8.3 Deployer Environment Variables
+
+| Variable | Description |
+|----------|-------------|
+| `DEPLOYER_PRIVATE_KEY` | Account used for contract deployment |
+| `DEPLOYER_ADMIN` | Admin address for contract access control |
+| `UPDATE_STATUS_OPERATOR` | Address authorized for state updates (Manager's address) |
+| `TEE_NO_ATTESTATION` | `true` for dev mode (skip Nitro attestation) |
+| `TEE_SIGNER_ADDRESS` | TEE signing address (derived from Executor signing key) |
+| `TEE_PUB_P521` | TEE P-521 public key (derived from Executor communication key) |
+| `MIN_FEE_PER_REQUEST` | Minimum fee per request (in Wei) |
+
