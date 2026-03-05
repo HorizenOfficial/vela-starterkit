@@ -4,21 +4,21 @@ networks:
     ipam:
       config:
         - subnet: ${INTERNAL_NETWORK_SUBNET}
-  inet:     
+  inet:
 
 volumes:
-  horizen-cce-manager-data:
-  horizen-cce-manager-reports:
-  horizen-cce-chain-data:
-  horizen-cce-logs:
-  horizen-cce-deploy-data:
-  horizen-cce-subgraph-postgres:
-  horizen-cce-subgraph-ipfs:
+  vela-skit-manager-data:
+  vela-skit-manager-reports:
+  vela-skit-chain-data:
+  vela-skit-logs:
+  vela-skit-deploy-data:
+  vela-skit-subgraph-postgres:
+  vela-skit-subgraph-ipfs:
 
 services:
   executor:
-    image: horizen/cce-executor:v0.0.18b
-    container_name: horizen-cce-executor
+    image: horizen/cce-executor:v0.0.25
+    container_name: vela-skit-executor
     restart: always
     privileged: true
     devices:
@@ -30,9 +30,8 @@ services:
       - CHANNEL_TYPE
       - EXECUTOR_IP_HOST
       - EXECUTOR_PORT
-      - EXECUTOR_ADMIN_PORT
-      - LOG_SERVER_IP_HOST
       - EXECUTOR_KEYSET_RECOVERY_TYPE
+      - LOG_SERVER_IP_HOST
       - EXECUTOR_FUEL_PRICE_PER_UNIT
       - EXECUTOR_MIN_FEE_PER_REQUEST
       - EXECUTOR_LOG_KIND
@@ -44,24 +43,26 @@ services:
       - EXECUTOR_LOG_PORT
       - EXECUTOR_LOG_NETWORK_LEVEL
       - EXECUTOR_COMMUNICATION_PARAMS_REQUEST_TIMEOUT_SEC
-      - ADMIN_COMMUNICATION_PARAMS_REQUEST_TIMEOUT_SEC
       - EXECUTOR_FIXED_SIGNING_KEY
       - EXECUTOR_FIXED_COMMUNICATION_KEY
       - EXECUTOR_FIXED_STATE_KEY
     depends_on:
       - chain
   manager:
-    image: horizen/cce-manager:v0.0.18b
-    container_name: horizen-cce-manager
+    image: horizen/cce-manager:v0.0.25
+    container_name: vela-skit-manager
     restart: always
     privileged: true
     devices:
-      - /dev/vsock:/dev/vsock 
+      - /dev/vsock:/dev/vsock
     environment:
       - CHANNEL_TYPE
       - EXECUTOR_IP_HOST
       - EXECUTOR_VSOCK_CID
-      - EXECUTOR_PORT  
+      - EXECUTOR_PORT
+      - MANAGER_ADMIN_COMMUNICATION_PARAMS_REQUEST_TIMEOUT_SEC
+      - MANAGER_IP_HOST
+      - MANAGER_ADMIN_PORT
       - MANAGER_KEY_SECP256
       - MANAGER_DATA_FOLDER=${MANAGER_DATA_FOLDER:-/data}
       - MANAGER_REPORTS_FOLDER=${MANAGER_REPORTS_FOLDER:-/reports}
@@ -81,6 +82,12 @@ services:
       - LOG_SERVER_FOLDER=${LOG_SERVER_FOLDER:-/logs}
       - LOG_SERVER_FILE_NAME
       - LOG_SERVER_FILE_LEVEL
+      # Log rotation settings (optional, only used when LOG_SERVER_FILE_NAME is set)
+      - LOG_SERVER_FILE_ROTATION
+      - LOG_SERVER_FILE_MAX_SIZE_MB
+      - LOG_SERVER_FILE_MAX_BACKUPS
+      - LOG_SERVER_FILE_MAX_AGE_DAYS
+      - LOG_SERVER_FILE_COMPRESS
       - CHAIN_RPC_PROTOCOL
       - CHAIN_RPC_ADDRESS
       - CHAIN_RPC_PORT
@@ -93,22 +100,22 @@ services:
     networks:
       pes_network:
         ipv4_address: ${MANAGER_IP_HOST}
-      inet:    
+      inet:
     volumes:
-      - horizen-cce-manager-data:${MANAGER_DATA_FOLDER:-/data}
-      - horizen-cce-manager-reports:${MANAGER_REPORTS_FOLDER:-/reports}
+      - vela-skit-manager-data:${MANAGER_DATA_FOLDER:-/data}
+      - vela-skit-manager-reports:${MANAGER_REPORTS_FOLDER:-/reports}
       # WASM input folder
       - ./wasms:${MANAGER_INPUT_WASMS:-/input_wasms}
-      - horizen-cce-logs:${LOG_SERVER_FOLDER:-/logs}
-      - horizen-cce-deploy-data:/deploy-data:ro
+      - vela-skit-logs:${LOG_SERVER_FOLDER:-/logs}
+      - vela-skit-deploy-data:/deploy-data:ro
     depends_on:
       executor:
         condition: service_started
       deployer:
         condition: service_completed_successfully
   authorityservice:
-    image: horizen/cce-authorityservice:v0.0.18b
-    container_name: horizen-cce-authorityservice
+    image: horizen/cce-authorityservice:v0.0.25
+    container_name: vela-skit-authorityservice
     restart: always
     ports:
       - "8081:8081"
@@ -132,8 +139,8 @@ services:
         ipv4_address: ${AUTHORITY_SERVICE_IP_ADDRESS}
       inet:
     volumes:
-      - horizen-cce-manager-reports:${MANAGER_REPORTS_FOLDER:-/reports}
-      - horizen-cce-deploy-data:/deploy-data:ro
+      - vela-skit-manager-reports:${MANAGER_REPORTS_FOLDER:-/reports}
+      - vela-skit-deploy-data:/deploy-data:ro
     depends_on:
       manager:
         condition: service_started
@@ -142,8 +149,8 @@ services:
       subgraph-deployer:
         condition: service_completed_successfully
   chain:
-    image: horizen/cce-chain:v0.0.18b
-    container_name: horizen-cce-chain
+    image: horizen/cce-chain:v0.0.25
+    container_name: vela-skit-chain
     restart: always
     environment:
       - DATA_FOLDER=${CHAIN_DATA_FOLDER:-/data}
@@ -155,10 +162,10 @@ services:
         ipv4_address: ${CHAIN_RPC_ADDRESS}
       inet:
     volumes:
-      - horizen-cce-chain-data:${CHAIN_DATA_FOLDER:-/data}
+      - vela-skit-chain-data:${CHAIN_DATA_FOLDER:-/data}
   deployer:
-    image: horizen/cce-deployer:v0.0.18b
-    container_name: horizen-cce-deployer
+    image: horizen/cce-deployer:v0.0.25
+    container_name: vela-skit-deployer
     restart: "no"
     environment:
       - CHAIN_RPC_URL=http://${CHAIN_RPC_ADDRESS}:${CHAIN_RPC_PORT:-8545}
@@ -176,13 +183,13 @@ services:
     networks:
       pes_network:
     volumes:
-      - horizen-cce-deploy-data:/deploy-data
+      - vela-skit-deploy-data:/deploy-data
     depends_on:
       chain:
         condition: service_started
   subgraph-postgres:
     image: postgres:14
-    container_name: horizen-cce-subgraph-postgres
+    container_name: vela-skit-subgraph-postgres
     restart: always
     command:
       [
@@ -199,7 +206,7 @@ services:
     networks:
       pes_network:
     volumes:
-      - horizen-cce-subgraph-postgres:/var/lib/postgresql/data
+      - vela-skit-subgraph-postgres:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U graph-node"]
       interval: 5s
@@ -207,12 +214,12 @@ services:
       retries: 10
   subgraph-ipfs:
     image: ipfs/kubo:v0.17.0
-    container_name: horizen-cce-subgraph-ipfs
+    container_name: vela-skit-subgraph-ipfs
     restart: always
     networks:
       pes_network:
     volumes:
-      - horizen-cce-subgraph-ipfs:/data/ipfs
+      - vela-skit-subgraph-ipfs:/data/ipfs
     entrypoint:
       - /bin/sh
       - -c
@@ -229,7 +236,7 @@ services:
       retries: 10
   subgraph-node:
     image: graphprotocol/graph-node
-    container_name: horizen-cce-subgraph-node
+    container_name: vela-skit-subgraph-node
     restart: always
     ports:
       - "8000:8000"
@@ -258,8 +265,8 @@ services:
       retries: 30
       start_period: 20s
   subgraph-deployer:
-    image: horizen/cce-subgraph-deployer:v0.0.18b
-    container_name: horizen-cce-subgraph-deployer
+    image: horizen/cce-subgraph-deployer:v0.0.25
+    container_name: vela-skit-subgraph-deployer
     restart: "no"
     environment:
       - GRAPH_NODE_URL=http://subgraph-node:8020
@@ -267,7 +274,7 @@ services:
     networks:
       pes_network:
     volumes:
-      - horizen-cce-deploy-data:/deploy-data:ro
+      - vela-skit-deploy-data:/deploy-data:ro
     depends_on:
       subgraph-node:
         condition: service_healthy
