@@ -5,7 +5,7 @@ It starts a dev chain using [Foundry Anvil](https://getfoundry.sh/anvil/overview
 
 - the TEE is only emulated (no real AWS Nitro Enclave is used, just a separate process)
 - only one single app deployment is supported - the app must have appId 1
-- based on horizen-pes  0.0.25 tag
+- based on Vela  0.0.25 tag
 
 ## Instructions:
 
