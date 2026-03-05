@@ -58,9 +58,9 @@ Currently only  a single-app manual deployment is supported:
 - go to https://github.com/HorizenOfficial/vela-nova/releases/tag/v0.0.25 <br>
 *(look for 0.0.25 tag for a compatible version with this dev enviroment)*
 - download payment_app.wasm into the wasms/ folder and rename to 1.wasm
-- use the nova-linux wallet executable to launch the deploy command and interact with the app.
+- download the nova-linux wallet executable (linux environment only) locally to interact with the app.
 
-    Use wallet.conf.template as wallet config file, with the following properties set to connect to this dev environment:
+    Use wallet.conf.template (rename it to wallet.conf) as wallet config file, with the following properties set to connect to this dev environment:
     
     ```
     rpcUrl=http://localhost:8545
@@ -69,8 +69,25 @@ Currently only  a single-app manual deployment is supported:
     AuthorityServiceURL=http://localhost:8081
     SubgraphURL=http://localhost:8000/subgraphs/name/hcce
     ```
+    You  will need also to set two keys property:
+    - keySecp256k1 property: you can use one of the private keys of the defaults Anvill accounts, which are pre-founded with 1000 ETH.
+    - keyP521 (used for private communication with the TEE): you can generate one with: <br>
+    ./nova-linux generatkeys
 
     Type "./nova-linux help" on a terminal to have an help on the wallet commands.
+
+    You will need to deploy the app  first:
+
+    ./nova-linux deployapp 1
+
+    Then you can try the following ones:
+
+    /nova-linux registeruser <br>
+    /nova-linux getpublicbalance <br>
+    /novaw-linux deposit -a "1 ETH" <br>
+    /nova-linux getprivatebalance <br>
+
+
 
 ### Other useful repositories to look into:
 
