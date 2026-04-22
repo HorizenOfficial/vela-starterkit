@@ -62,9 +62,9 @@ In v0.0.25, common WASM types (`Address`, `Uint256`, `PlainEvent`, `Withdrawal`,
 
 | Package | Provides |
 |---------|----------|
-| `vela-common-go/wasm/types` | Core types (`Address`, `Uint256`, `PlainEvent`, `Withdrawal`), result types (`LoadModuleResult`, `DepositResult`, `ProcessResult`), serialization helpers (`SerializeAndWriteResult`, `PtrToAddress`, `PtrToUint256`) |
-| `vela-common-go/wasm/utils` | Memory management (`allocate`/`deallocate`, `StringToPtr`), pointer conversion (`PtrToString`), logging (`LogError/Warn/Info/Debug/Trace`) |
-| `vela/pkg/common` | Request type constants (`Process`, `Deanonymize`, etc.) used for routing inside `process_request` |
+| `vela-common-go/wasm/types` | Core types (`Address`, `Uint256`, `PlainEvent`, `AppEvent`, `Withdrawal`), result types (`LoadModuleResult`, `DepositResult`, `ProcessResult`, `DeployResult`), serialization helpers (`SerializeAndWriteResult`, `PtrToAddress`, `PtrToUint256`) |
+| `vela-common-go/wasm/utils` | Memory management (`allocate`/`deallocate`, `BytesToPtr`, `get_allocated_memory_stats`), pointer conversion (`PtrToString`), logging (`LogError/Warn/Info/Debug/Trace`) |
+| `vela/pkg/common` | Request type constants (`Deploy`, `Process`, `Deanonymize`, `AssociateKey`) used for routing inside `process_request` |
 | `app` (local) | Application-specific business logic, state types, instruction types, event types |
 
 
@@ -389,7 +389,9 @@ case "withdraw":
         *currentState.Accounts[senderHex].Balance, *instructions.Withdraw.Amount)
     currentState.Nonce++
 
-    // Withdrawal instruction — processed by the smart contract
+    // Withdrawal instruction — processed by the smart contract.
+    // TokenAddress is left zero here (defaults to native ETH). For ERC-20
+    // withdrawals, set TokenAddress to the token contract address.
     withdrawals = append(withdrawals, Withdrawal{
         DestinationAddress: instructions.Withdraw.To,
         Amount:             instructions.Withdraw.Amount,
@@ -502,6 +504,8 @@ events = append(events, PlainEvent{
 ```
 
 `EventSubType` is emitted in plaintext on-chain (for filtering/indexing). `Data` is encrypted — only the target user can read it. Design your sub-types to not leak sensitive information.
+
+If you need to emit a public, application-wide signal (not targeted at any single user), append to the `AppEvents` slice on `DepositResult` / `ProcessResult` instead. `AppEvent.Data` is **not** encrypted and is emitted on-chain as `AppEvent(applicationId, requestId, eventSubType, data)`.
 
 ---
 

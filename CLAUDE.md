@@ -44,7 +44,7 @@ Volume prefix: `vela-skit-*`. Container prefix: `vela-skit-*`.
 
 ## Key Architecture Facts (v0.0.25)
 
-- **WASM exports**: `load_module`, `deposit`, `process_request` (with `requestType int32` param). The old `generate_deanonymization_report` export was removed — deanonymization is now a case inside `process_request` routed via `requestType`.
+- **WASM exports**: `load_module`, `deploy` (called once at app deployment with constructor params), `deposit`, `process_request` (with `requestType int32` param). The old `generate_deanonymization_report` export was removed — deanonymization is now a case inside `process_request` routed via `requestType`.
 - **ProcessResult** has an optional `Report []byte` field for deanonymization data.
 - **Common types** (`Address`, `Uint256`, `PlainEvent`, `Withdrawal`, result structs) come from `vela-common-go/wasm/types`, not defined locally per app.
 - **TypeScript client** class is `VelaClient` (renamed from `HorizenCCEClient`). Package is `vela-common-ts` (renamed from `horizen-cce-common-ts`).

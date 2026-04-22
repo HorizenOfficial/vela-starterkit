@@ -64,16 +64,19 @@ The on-chain layer coordinates request submission, TEE attestation, and state ma
 
 The primary contract. Manages a FIFO request queue and processes state updates.
 
-- **Request submission** (`submitRequest`): Users enqueue requests with a deposit and max fee. Each request includes an application ID, request type, and encrypted payload.
-- **State update** (`stateUpdate`): Called by the Manager after execution. Verifies the TEE signature, updates the on-chain state root, emits encrypted events, processes withdrawals and refunds via pull-payment.
-- **Failure handling** (`markRequestFailed`): Marks a request as failed and refunds the sender.
-- **Access control**: `UPDATE_STATUS_ROLE` for state updates; `ADMIN` for configuration.
+- **Request submission** (`submitRequest`): Users enqueue `PROCESS`, `DEANONYMIZATION` or `ASSOCIATEKEY` requests. Each request carries an application ID, request type, encrypted payload, a token address (`0x0` = native ETH), an asset amount, and a max fee. `DEPLOYAPP` is rejected here — deployments use a separate entry point.
+- **Deploy submission** (`submitDeployRequest`): Restricted to addresses with `DEPLOYER_ROLE`. Takes a protocol version and a deploy descriptor payload referencing the WASM artifact by its `sha256`. A unique `applicationId` is derived from the request ID for each deploy.
+- **State update** (`stateUpdate`): Called by the Manager after execution. Verifies the TEE signature, updates the on-chain state root, emits encrypted events, processes withdrawals and refunds via pull-payment claims. The TEE also reports success/failure inline via `errorCode` + `errorMsg` — there is no separate `markRequestFailed` function.
+- **Claims** (`claim`, `pendingClaims`): Withdrawal and refund amounts are credited to per-token pull-payment balances; recipients call `claim(tokenAddress, payee)` to collect.
+- **ERC-20 support**: For non-ETH tokens the caller must `approve` the `ProcessorEndpoint` up to `assetAmount` before calling `submitRequest`; tokens are pulled via `safeTransferFrom`. Only tokens in the `TokenAllowlist` are accepted.
+- **Access control**: `UPDATE_STATUS_ROLE` for state updates; `DEPLOYER_ROLE` for deploy submissions; `ADMIN` for configuration.
 
 Key data structures:
 ```solidity
 struct PendingRequest {
     uint256 timestamp;
-    uint256 depositAmount;
+    address tokenAddress;     // 0x0 = ETH
+    uint256 assetAmount;      // business asset amount (deposit for PROCESS / 0 for others)
     uint256 maxFeeValue;
     bytes32 requestId;
     bytes   payload;
@@ -82,9 +85,15 @@ struct PendingRequest {
     uint8   protocolVersion;
     RequestType requestType;  // DEPLOYAPP | PROCESS | DEANONYMIZATION | ASSOCIATEKEY
 }
+
+struct WithdrawalRequest {
+    address tokenAddress;     // 0x0 = ETH
+    address payable receiver;
+    uint256 amount;
+}
 ```
 
-Events: `RequestSubmitted`, `RequestCompleted`, `StateRootUpdate`, `UserEvent` (encrypted), `Refund`, `Withdrawal`.
+Events: `RequestSubmitted`, `RequestCompleted` (carries `errorCode` + `errorMessage`), `DeployRequestSubmitted`, `DeployRequestCompleted`, `StateRootUpdate`, `UserEvent` (encrypted, per-user), `AppEvent` (plaintext, application-level), `Refund` (with `tokenAddress`), `Withdrawal` (with `tokenAddress`), `ReportGenerated`, `PaymentWithdrawn`.
 
 #### TeeAuthenticator
 
@@ -93,7 +102,7 @@ Manages TEE identity. Verifies AWS Nitro Enclave attestation documents against e
 - **Multi-step attestation** (`updateTeeStep1`..`4`): Breaks large attestation verification across multiple transactions to fit gas limits.
 - **Signature verification** (`checkSignature`): Called by ProcessorEndpoint during `stateUpdate`. Recovers the signer from an ECDSA signature and verifies it matches the registered TEE address.
 
-The signed message covers: `applicationId`, `prevStateRoot`, `newStateRoot`, `requestId`, `hash(events)`, `hash(eventSubTypes)`, `hash(withdrawals)`, `refundAmount`, `applicationFee`.
+The signed message covers: `applicationId`, `prevStateRoot`, `newStateRoot`, `processedRequestId`, `hash(events)`, `hash(eventSubTypes)`, `hash(withdrawalRequests)`, `refundAmount`, `applicationFee`, `errorCode`, `errorMsg`.
 
 #### AuthorityRegistry & DefaultAuthority
 
@@ -124,14 +133,14 @@ every N seconds:
      - Process / Deanonymize / AssociateKey → load state + WASM, send to Executor
   4. Store new encrypted state in LevelDB
   5. Submit signed UpdatePayload to blockchain
-  6. On failure: rollback state, mark request failed on-chain
+  6. On failure: rollback state, call stateUpdate with errorCode + errorMsg to mark the request failed on-chain
 ```
 
 **Key interfaces:**
 
 | Interface | Purpose |
 |-----------|---------|
-| `blockchain.Client` | Fetch requests, submit state updates, mark failures |
+| `blockchain.Client` | Fetch requests, submit state updates (success or error) |
 | `communication.ExecutorClient` | Send process/deploy requests, handle keyset handshake |
 | `storage.DataLayer` | Store/retrieve versioned state, WASM bytecode, keyset recovery |
 
@@ -181,14 +190,14 @@ The Executor runs inside the AWS Nitro Enclave (TEE) and handles all cryptograph
 ```
 1. Decrypt application state (AES-256 with StateKey)
 2. Deserialize into AppData (state + user key store)
-3. If deposit: call WASM deposit()
-4. If AssociateKey: register sender's P521 public key
+3. If assetAmount > 0: call WASM deposit()
+4. If AssociateKey: register sender's P521 public key (+ optional encrypted subtype seed)
 5. Otherwise (Process or Deanonymize):
    - decrypt payload (ECDH)
    - call WASM process_request() with requestType parameter
    - the WASM app uses requestType to route internally
 6. Encrypt new state (AES-256), compute state root (SHA256)
-7. Encrypt events using recipient P521 public keys (ECDH → AES-GCM)
+7. Encrypt `PlainEvent` entries using recipient P521 public keys (ECDH → AES-GCM); `AppEvent` entries pass through as plaintext
 8. If Deanonymize: validate that report data is present in the response
 9. Sign UpdatePayload with secp256k1 SigningKey
 10. Return: UpdatePayload + encrypted ApplicationState + optional DeanonymizationReport
@@ -200,15 +209,25 @@ The Executor runs inside the AWS Nitro Enclave (TEE) and handles all cryptograph
 
 ### 3.1 Deploy Application
 
+A deploy has two phases: off-chain WASM artifact upload, then on-chain `submitDeployRequest`.
+
+1. The deployer (must hold `DEPLOYER_ROLE`) uploads the WASM binary to the Authority Service, which stores it in the shared artifact folder keyed by `sha256(wasm)`.
+2. The deployer calls `submitDeployRequest(protocolVersion, payload)` on `ProcessorEndpoint`, where `payload` is a JSON deploy descriptor: `{ "mode": "artifact_ref", "artifactId": "sha256:<hex>", "wasmSha256": "<hex>", "constructorParams": … }`.
+3. The contract derives a fresh `applicationId` from the request hash and enqueues the deploy.
+
 ```
-User                     Blockchain              Manager                Executor
+Deployer                 Blockchain              Manager                Executor
   │                          │                      │                      │
-  │─ submitRequest(DEPLOY) ──>│                      │                      │
-  │   (WASM bytecode in       │                      │                      │
-  │    payload, deposit+fee)  │                      │                      │
-  │                          │<── poll ──────────────│                      │
-  │                          │── PendingRequest ────>│                      │
-  │                          │                      │── SendDeployApp ─────>│
+  │─ (upload WASM to         │                      │                      │
+  │   Authority Service)     │                      │                      │
+  │                          │                      │                      │
+  │─ submitDeployRequest ───>│                      │                      │
+  │   (deploy descriptor     │                      │                      │
+  │    payload, maxFee)      │                      │                      │
+  │                          │<── poll ─────────────│                      │
+  │                          │── PendingRequest ───>│                      │
+  │                          │                      │── load WASM by sha256│
+  │                          │                      │── SendDeployApp ────>│
   │                          │                      │                      │─ compile WASM
   │                          │                      │                      │─ call load_module()
   │                          │                      │                      │─ encrypt initial state
@@ -220,7 +239,7 @@ User                     Blockchain              Manager                Executor
   │                          │<── stateUpdate ──────│   in LevelDB         │
   │                          │── verify sig ────────│                      │
   │                          │── update state root  │                      │
-  │<── RequestCompleted ─────│                      │                      │
+  │<── DeployRequestCompleted│                      │                      │
 ```
 
 ### 3.2 Process Request (Standard)
@@ -230,7 +249,8 @@ User                     Blockchain              Manager                Executor
   │                          │                      │                      │
   │─ submitRequest(PROCESS) ─>│                      │                      │
   │   (encrypted payload,     │                      │                      │
-  │    deposit+fee)           │                      │                      │
+  │    tokenAddress,          │                      │                      │
+  │    assetAmount, maxFee)   │                      │                      │
   │                          │<── poll ──────────────│                      │
   │                          │── PendingRequest ────>│                      │
   │                          │                      │── load state+WASM    │
@@ -256,7 +276,7 @@ User                     Blockchain              Manager                Executor
 
 ### 3.3 Associate Key
 
-Before a user can receive encrypted events or submit encrypted payloads, they register their P-521 public key on-chain via an `ASSOCIATEKEY` request. The Executor stores this key in the user key store (part of AppData). Subsequent event encryption uses this key via ECDH.
+Before a user can receive encrypted events or submit encrypted payloads, they register their P-521 public key on-chain via an `ASSOCIATEKEY` request. The payload is either the raw 133-byte uncompressed public key, or 226 bytes = public key || encrypted subtype seed (when the user opts in to privacy-preserving event sub-types derived from an HMAC'd seed). The Executor stores the key (and, if provided, the seed) in the user key store (part of AppData). Subsequent event encryption uses this key via ECDH.
 
 ### 3.4 Deanonymization
 
@@ -293,30 +313,33 @@ type LoadModuleResult struct {
 }
 ```
 
-#### `deposit(appId: i64, senderPtr: *byte, senderLen: i32, valuePtr: *byte, valueLen: i32, statePtr: *byte, stateLen: i32) -> *byte`
+#### `deposit(appId: i64, senderPtr: *byte, senderLen: i32, tokenPtr: *byte, tokenLen: i32, valuePtr: *byte, valueLen: i32, statePtr: *byte, stateLen: i32) -> *byte`
 
-Called when a user sends funds (deposit) with their request.
+Called when a user sends funds (deposit) with their request. `tokenPtr`/`tokenLen` carry the token address (`0x0` for native ETH, otherwise an allowlisted ERC-20).
 
 ```go
 //export deposit
 func deposit(appId int64, senderPtr *byte, senderLen int32,
+             tokenPtr *byte, tokenLen int32,
              valuePtr *byte, valueLen int32,
              statePtr *byte, stateLen int32) *byte {
-    sender := myapp.PtrToAddress(senderPtr, senderLen)
-    value  := myapp.PtrToUint256(valuePtr, valueLen)
+    sender := types.PtrToAddress(senderPtr, senderLen)
+    token  := types.PtrToAddress(tokenPtr, tokenLen)
+    value  := types.PtrToUint256(valuePtr, valueLen)
     state  := utils.PtrToString(statePtr, stateLen)
-    result := myapp.DepositFunds(sender, value, state)
-    return myapp.SerializeAndWriteResult(result)
+    result := myapp.DepositFunds(sender, token, value, state)
+    return types.SerializeAndWriteResult(result)
 }
 ```
 
 Returns `DepositResult`:
 ```go
 type DepositResult struct {
-    State  []byte       `json:"state"`            // Updated state
-    Events []PlainEvent `json:"events"`            // Emitted events
-    Fuel   *Uint256     `json:"fuel"`              // Fuel consumed
-    Error  string       `json:"error,omitempty"`
+    State     []byte       `json:"state"`               // Updated state
+    Events    []PlainEvent `json:"events"`              // Per-user encrypted events
+    AppEvents []AppEvent   `json:"appEvents"`           // Application-level plaintext events
+    Fuel      *Uint256     `json:"fuel"`                // Fuel consumed
+    Error     string       `json:"error,omitempty"`
 }
 ```
 
@@ -342,7 +365,8 @@ Returns `ProcessResult`:
 ```go
 type ProcessResult struct {
     State       []byte       `json:"state"`              // Updated state
-    Events      []PlainEvent `json:"events"`              // Emitted events
+    Events      []PlainEvent `json:"events"`              // Per-user encrypted events
+    AppEvents   []AppEvent   `json:"appEvents"`           // Application-level plaintext events
     Withdrawals []Withdrawal `json:"withdrawals"`         // Fund transfers
     Report      []byte       `json:"report,omitempty"`    // Deanonymization report (only for DEANONYMIZATION requests)
     Fuel        *Uint256     `json:"fuel"`                // Fuel consumed
@@ -364,7 +388,7 @@ func allocate(size int32) int32        // allocates memory in WASM linear memory
 func deallocate(ptr *byte, size int32) // frees previously allocated memory
 ```
 
-The `utils` package also provides `StringToPtr` for returning results (4-byte little-endian length prefix + data) and `PtrToString` for reading host-provided data.
+The `utils` package also provides `BytesToPtr` for returning results (4-byte little-endian length prefix + data) and `PtrToString` for reading host-provided data.
 
 #### `get_memory_stats() -> *byte` (optional)
 
@@ -372,7 +396,7 @@ Returns memory allocation statistics. Useful for debugging.
 
 ### 4.2 Types
 
-In v0.0.25, common WASM types are provided by the shared library `github.com/HorizenOfficial/vela-common-go/wasm/types`. This library defines the core types (`Address`, `Uint256`, `PlainEvent`, `Withdrawal`, result structs) and helper functions (`SerializeAndWriteResult`, `PtrToAddress`, `PtrToUint256`). The utility functions (`PtrToString`, `StringToPtr`, logging) are in `vela-common-go/wasm/utils`.
+In v0.0.25, common WASM types are provided by the shared library `github.com/HorizenOfficial/vela-common-go/wasm/types`. This library defines the core types (`Address`, `Uint256`, `PlainEvent`, `AppEvent`, `Withdrawal`, result structs) and helper functions (`SerializeAndWriteResult`, `PtrToAddress`, `PtrToUint256`). The utility functions (`PtrToString`, `BytesToPtr`, `allocate`/`deallocate`, `get_allocated_memory_stats`, logging) are in `vela-common-go/wasm/utils`.
 
 The WASM guest module still communicates with the host via JSON serialization — both sides define compatible types independently. The guest cannot import host packages (e.g., `go-ethereum`), but it now shares type definitions with other WASM applications through the common library.
 
@@ -381,9 +405,10 @@ The WASM guest module still communicates with the host via JSON serialization �
 | Type | Description |
 |------|-------------|
 | `Address` | 20-byte Ethereum address (`[20]byte`). JSON: `"0x..."` hex string. |
-| `Uint256` | 256-bit unsigned integer (`[4]uint64`). JSON: `"0x..."` hex string. Supports `Add`, `Sub`, `Cmp`, `AddOverflow`, `IsZero`. Custom implementation (no `math/big` in TinyGo). |
-| `PlainEvent` | Event to emit: `UserID` (Address), `EventSubType` (string), `Data` ([]byte). |
-| `Withdrawal` | Withdrawal instruction: `DestinationAddress` (Address), `Amount` (*Uint256). |
+| `Uint256` | 256-bit unsigned integer (`[4]uint64`). JSON: `"0x..."` hex string. Supports `Add`, `Sub`, `Cmp`, `AddOverflow`, `SubOverflow`, `Mul64`, `Add64`, `IsZero`, `Eq`, `SetHex`, `ToHex`. Custom implementation (no `math/big` in TinyGo). |
+| `PlainEvent` | Per-user encrypted event: `UserID` (Address), `EventSubType` (string), `Data` ([]byte). Executor encrypts `Data` with the target user's P-521 key. |
+| `AppEvent` | Application-level plaintext event (not encrypted, visible on-chain): `EventSubType` (string), `Data` ([]byte). Emitted via the `AppEvent` contract event. |
+| `Withdrawal` | Withdrawal instruction: `TokenAddress` (Address — `0x0` = ETH), `DestinationAddress` (Address), `Amount` (*Uint256). |
 
 **Helper functions** (defined in `vela-common-go/wasm/types`):
 
@@ -398,21 +423,23 @@ The WASM guest module still communicates with the host via JSON serialization �
 | Function | Description |
 |----------|-------------|
 | `PtrToString(ptr, len)` | Convert WASM pointer to Go string |
-| `StringToPtr(data)` | Convert Go byte slice to WASM pointer (4-byte length prefix + data) |
+| `BytesToPtr(data)` | Convert Go byte slice to WASM pointer (4-byte length prefix + data) |
 | `LogError/Warn/Info/Debug/Trace(fmt, args...)` | Logging with prefixes (ERR/WRN/INF/DBG/TRC), captured by host via WASI stdout pipe |
 
 ### 4.3 Request Types
 
 The Executor routes requests by type to the appropriate WASM export:
 
-| Value | Type | WASM Export Called |
-|-------|------|-------------------|
-| 0 | `DEPLOYAPP` | `load_module` |
-| 1 | `PROCESS` | `deposit` (if funds included) + `process_request(requestType=1)` |
-| 2 | `DEANONYMIZATION` | `process_request(requestType=2)` — app returns report in `ProcessResult.Report` |
-| 3 | `ASSOCIATEKEY` | None (handled entirely by the Executor) |
+| Value | Type | Submitted via | WASM Export Called |
+|-------|------|--------------|-------------------|
+| 0 | `DEPLOYAPP` | `submitDeployRequest` (DEPLOYER_ROLE only) | `load_module` |
+| 1 | `PROCESS` | `submitRequest` | `deposit` (if `assetAmount > 0`) + `process_request(requestType=1)` |
+| 2 | `DEANONYMIZATION` | `submitRequest` (AuthorityRegistry-gated) | `process_request(requestType=2)` — app returns report in `ProcessResult.Report` |
+| 3 | `ASSOCIATEKEY` | `submitRequest` | None (handled entirely by the Executor) |
 
 The `requestType` is passed to `process_request` as an `int32` parameter. The WASM application uses it to determine which logic to execute (e.g., standard processing vs. deanonymization report generation). This is a change from earlier versions where deanonymization had a separate WASM export.
+
+`submitRequest` rejects `DEPLOYAPP` with `InvalidRequestType` — deploys must go through `submitDeployRequest`, which derives a fresh `applicationId` from the request hash.
 
 ### 4.4 State Management
 
@@ -424,17 +451,24 @@ The `requestType` is passed to `process_request` as an `int32` parameter. The WA
 
 ### 4.5 Events
 
-Events are the primary mechanism to communicate results to users.
+An application can emit two kinds of events from `deposit` / `process_request`:
 
-- Each `PlainEvent` targets a specific user (`UserID`).
-- The Executor encrypts each event using the target user's registered P-521 public key (ECDH → AES-GCM).
-- Events are emitted on-chain as `UserEvent(appId, requestId, eventSubType, encryptedData)`.
-- Users decrypt events off-chain using their P-521 private key.
-- `EventSubType` is a plaintext string for event filtering (not encrypted).
+**`PlainEvent` (per-user, encrypted):**
+- Targets a specific user (`UserID`).
+- The Executor encrypts `Data` using the target user's registered P-521 public key (ECDH → AES-GCM).
+- Emitted on-chain as `UserEvent(appId, requestId, eventSubType, encryptedData)`.
+- Users decrypt off-chain using their P-521 private key.
+
+**`AppEvent` (application-level, plaintext):**
+- No recipient — intended for public/app-wide signals (e.g. global state notifications).
+- `Data` is **not** encrypted and is visible on-chain.
+- Emitted as `AppEvent(appId, requestId, eventSubType, data)`.
+
+`EventSubType` is always a plaintext string (usable as an indexer/subgraph filter). Design your sub-types so they don't leak sensitive information.
 
 ### 4.6 Withdrawals
 
-Return `Withdrawal` entries to transfer funds from the contract to a destination address. The smart contract validates that total withdrawals do not exceed the contract balance, and credits are distributed via pull-payment.
+Return `Withdrawal` entries to transfer funds from the contract to a destination address. Each withdrawal specifies a `TokenAddress` (`0x0` for native ETH, or an allowlisted ERC-20 address). The smart contract validates the app's custody balance per token, then credits the destination via pull-payment — recipients call `claim(tokenAddress, payee)` to collect.
 
 ### 4.7 Fuel
 
