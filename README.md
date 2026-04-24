@@ -1,4 +1,4 @@
-# Horizen Vela - Developer Strter Kit
+# Horizen Vela - Developer Starter Kit
 
 This repository contains the resources needed to implement and test a Proof of Concept based on Horizen Vela — a platform that executes WebAssembly (WASM) modules inside AWS Nitro Enclaves (TEE), with encrypted state management and blockchain-based coordination.
 

@@ -1,6 +1,6 @@
-# Vela TypeScript Client Library (v0.0.25)
+# Vela TypeScript Client Library (v0.1.0)
 
-The `vela-common-ts` library provides everything a browser application needs to interact with the Vela CCE platform: key derivation from a wallet, payload encryption, request submission, event decryption, and withdrawal collection. It is designed for browser environments using the Web Crypto API.
+The `@horizen/vela-common-ts` library provides everything a browser application needs to interact with the Vela CCE platform: key derivation from a wallet, payload encryption, request submission, event decryption, and withdrawal collection. It is designed for browser environments using the Web Crypto API.
 
 > **Prerequisite**: Read `1_summary.md` for the full system architecture. This document focuses on the client side — how a user's browser application communicates with the platform.
 
@@ -11,10 +11,10 @@ Source code: https://github.com/HorizenOfficial/vela-common-ts
 ## Installation
 
 ```bash
-npm install vela-common-ts ethers
+npm install @horizen/vela-common-ts ethers
 ```
 
-`ethers` v6 is a peer dependency (used for wallet integration and contract interaction).
+The package is published under the `@horizen/` scope. `ethers` v6 is a peer dependency (used for wallet integration and contract interaction).
 
 ---
 
@@ -29,15 +29,17 @@ A typical user interaction follows this flow:
 4. Encrypt & send request   →  encryptForTee(payload) → submitRequest(PROCESS, ...)
 5. Wait for completion      →  getRequestCompletedEvent(requestId, ...)
 6. Decrypt response events  →  getCurrentUserEvents(...) or fetchAndDecryptUserEvents(...)
-7. Collect withdrawals      →  getPendingPayments(...) → withdrawPayments(...)
+7. Collect withdrawals      →  getPendingClaims(token, addr) → claim(token, addr)
 ```
+
+Deployers additionally use `submitDeployRequest*` / `getDeployRequestCompletedEvent` — see the [Deploying a WASM Application](#deploying-a-wasm-application) section.
 
 ---
 
 ## Connecting a Wallet
 
 ```typescript
-import { ethersSignerFromBrowser } from "vela-common-ts";
+import { ethersSignerFromBrowser } from "@horizen/vela-common-ts";
 
 // Get signer from MetaMask (or any injected wallet)
 const signer = await ethersSignerFromBrowser();
@@ -50,7 +52,7 @@ This uses `window.ethereum` to create an ethers.js `BrowserProvider` and returns
 ## Initializing the Client
 
 ```typescript
-import { VelaClient } from "vela-common-ts";
+import { VelaClient } from "@horizen/vela-common-ts";
 
 const client = new VelaClient(
   signer,
@@ -120,7 +122,7 @@ import {
   importPrivateKeyFromJWK,          // import a private key from JWK
   exportPrivateKeyToJWK,            // export a private key to JWK
   P521KeyPair,
-} from "vela-common-ts";
+} from "@horizen/vela-common-ts";
 
 // Derive with custom challenge/salt/info
 const keyPair = await deriveP521PrivateKeyFromSigner(
@@ -148,26 +150,47 @@ const jwk = await exportPrivateKeyToJWK(keyPair.privateKey);
 
 Before you can receive encrypted events or submit encrypted payloads, your P-521 public key must be registered on-chain via an `ASSOCIATEKEY` request.
 
+The `ASSOCIATEKEY` payload is either:
+- **133 bytes** — raw uncompressed P-521 public key only, or
+- **226 bytes** — public key (133 B) concatenated with an encrypted subtype seed (93 B). Opt in to this form if you want privacy-preserving event sub-types derived from the seed via HMAC (see `generateSubtypeSet`).
+
 ```typescript
-import { RequestType, exportPublicKeyToHex } from "vela-common-ts";
+import {
+  RequestType,
+  exportPublicKeyToHex,
+  hexToBytes,
+  ETH_TOKEN,
+  PROTOCOL_VERSION,
+  buildAssociateKeyPayload,
+} from "@horizen/vela-common-ts";
 
 const keyPair = await client.getSignerKeyPair();
 const publicKeyHex = await exportPublicKeyToHex(keyPair.publicKey);
+
+// Option A: 133-byte payload (public key only)
 const publicKeyBytes = hexToBytes(publicKeyHex);
 
+// Option B: 226-byte payload (public key + encrypted subtype seed)
+// const publicKeyBytes = await buildAssociateKeyPayload(
+//   keyPair.publicKey,
+//   await client.getTeePublicKey(),
+//   seed,
+// );
+
 const receipt = await client.submitRequestAndWaitForRequestId(
-  1,                         // protocol version
+  PROTOCOL_VERSION,          // protocol version
   applicationId,             // your application ID
   RequestType.ASSOCIATEKEY,  // request type
-  publicKeyBytes,            // payload = raw public key bytes
-  0n,                        // no deposit
+  publicKeyBytes,            // payload = public key (+ optional encrypted seed)
+  ETH_TOKEN,                 // token address (0x0 for ETH)
+  0n,                        // asset amount (no deposit for ASSOCIATEKEY)
   maxFee                     // max fee in wei
 );
 
 console.log("Key registered, requestId:", receipt.requestId);
 ```
 
-The Executor stores your public key in the application's user key store. All future events targeted at your address will be encrypted with this key.
+The Executor stores your public key (and optional subtype seed) in the application's user key store. All future events targeted at your address will be encrypted with this key.
 
 ---
 
@@ -176,7 +199,7 @@ The Executor stores your public key in the application's user key store. All fut
 ### Encrypt and Submit
 
 ```typescript
-import { RequestType, stringToBytes } from "vela-common-ts";
+import { RequestType, stringToBytes, ETH_TOKEN, PROTOCOL_VERSION } from "@horizen/vela-common-ts";
 
 // 1. Build your payload (application-specific JSON)
 const payload = JSON.stringify({
@@ -193,13 +216,14 @@ const encryptedPayload = await client.encryptForTee(
   stringToBytes(payload)
 );
 
-// 3. Submit on-chain
+// 3. Submit on-chain (ETH example)
 const receipt = await client.submitRequestAndWaitForRequestId(
-  1,                       // protocol version
+  PROTOCOL_VERSION,        // protocol version
   applicationId,           // application ID
   RequestType.PROCESS,     // request type
   encryptedPayload,        // encrypted payload
-  depositAmount,           // deposit in wei (bigint)
+  ETH_TOKEN,               // token address (0x0 = native ETH)
+  assetAmount,             // asset amount in wei (bigint)
   maxFee                   // max fee in wei (bigint)
 );
 
@@ -213,7 +237,24 @@ console.log("Request submitted, id:", receipt.requestId);
 4. Derives an AES-256 key via HKDF
 5. Encrypts the payload with AES-256-GCM
 
-The transaction value sent to the contract is `depositAmount + maxFee`.
+For ETH (`tokenAddress === ETH_TOKEN`) the transaction value sent to the contract is `assetAmount + maxFeeValue`. For ERC-20 tokens, the transaction value is only `maxFeeValue` — the asset is pulled via `transferFrom`, so the caller must pre-approve the `ProcessorEndpoint`:
+
+```typescript
+// One-time approval per token (or per session) before ERC-20 submits
+await (await client.approveToken(erc20Address, assetAmount)).wait();
+
+const receipt = await client.submitRequestAndWaitForRequestId(
+  PROTOCOL_VERSION,
+  applicationId,
+  RequestType.PROCESS,
+  encryptedPayload,
+  erc20Address,            // token contract address
+  assetAmount,             // amount to pull via transferFrom
+  maxFee,
+);
+```
+
+Only tokens registered in the on-chain `TokenAllowlist` are accepted.
 
 ### Request Types
 
@@ -228,20 +269,21 @@ enum RequestType {
 
 ### Deposit (Funding Your Account)
 
-To deposit funds into your application account, submit a `PROCESS` request with a `depositAmount`:
+To deposit funds into your application account, submit a `PROCESS` request with a non-zero `assetAmount`:
 
 ```typescript
 const receipt = await client.submitRequestAndWaitForRequestId(
-  1,
+  PROTOCOL_VERSION,
   applicationId,
   RequestType.PROCESS,
   encryptedPayload,      // can be an empty encrypted payload
+  ETH_TOKEN,             // or an ERC-20 address (must be approved first)
   parseEther("1.0"),     // deposit 1 ETH
   maxFee
 );
 ```
 
-The smart contract holds the deposit. The WASM application's `deposit()` function credits the user's internal account.
+The smart contract takes custody of the asset (native transfer for ETH; `transferFrom` for ERC-20). The WASM application's `deposit()` function credits the user's internal account.
 
 ---
 
@@ -273,13 +315,16 @@ Events are the primary way the application communicates results back to users. E
 ### Option A: Direct Contract Query
 
 ```typescript
+import { encodeBytes32String } from "ethers";
+
 const events = await client.getCurrentUserEvents(
-  currentBlock,     // fromBlock (upper bound)
-  deployBlock,      // toBlock (lower bound)
+  currentBlock,                        // fromBlock (upper bound)
+  deployBlock,                         // toBlock (lower bound)
   applicationId,
-  "deposit",        // eventSubType filter (or undefined for all)
-  (data) => true,   // filter function on decrypted payload
-  false             // stopAtFirst
+  undefined,                           // requestId filter (or undefined)
+  encodeBytes32String("deposit"),      // eventSubType — must be a bytes32 hex (or undefined for all)
+  (data) => true,                      // filter function on decrypted payload
+  false                                // stopAtFirst
 );
 
 for (const eventBytes of events) {
@@ -288,6 +333,8 @@ for (const eventBytes of events) {
   // { type: "deposit", amount: "0x...", balance: "0x...", nonce: 1 }
 }
 ```
+
+> `eventSubType` in both the contract events (`UserEvent` / `AppEvent`) and the subgraph is an indexed `bytes32`. Pass a bytes32 hex string when querying — `ethers.encodeBytes32String(label)` packs a short ASCII label; use `ethers.decodeBytes32String(hex)` to read one back.
 
 The client internally:
 1. Queries `UserEvent` logs from the `ProcessorEndpoint` contract
@@ -305,7 +352,7 @@ import {
   fetchAndDecryptUserEvents,
   importPublicKeyFromHex,
   bytesToString,
-} from "vela-common-ts";
+} from "@horizen/vela-common-ts";
 
 // Create subgraph client
 const subgraph = createSubgraphClient(
@@ -323,15 +370,17 @@ const teePublicKey = await importPublicKeyFromHex(teePublicKeyHex);
 // Get user's private key
 const keyPair = await client.getSignerKeyPair();
 
-// Fetch and decrypt events
+// Fetch and decrypt events — eventSubType must be a bytes32 hex
+import { encodeBytes32String } from "ethers";
+
 const events = await fetchAndDecryptUserEvents(
   subgraph,
   teePublicKey,
   keyPair.privateKey,
   applicationId,
-  "transfer_received",   // eventSubType filter
-  10,                     // limit (0 = no limit)
-  (data) => true          // optional filter on decrypted payload
+  encodeBytes32String("transfer_received"), // eventSubType filter (bytes32 hex)
+  10,                                        // limit (0 = no limit)
+  (data) => true                             // optional filter on decrypted payload
 );
 
 for (const eventBytes of events) {
@@ -346,16 +395,27 @@ for (const eventBytes of events) {
 
 ```typescript
 interface UserEvent {
-  applicationId: number;
+  applicationId: bigint;
   requestId: string;
   eventSubType: string;
-  encryptedData: Uint8Array;  // raw encrypted bytes
+  encryptedData: Uint8Array;   // raw encrypted bytes
   blockNumber: number;
   logIndex: number;
-  sortKey: bigint;            // for pagination cursor
+  sortKey: bigint;             // for pagination cursor
+}
+
+interface AppEvent {                // plaintext app-level event
+  applicationId: bigint;
+  requestId: string;
+  eventSubType: string;
+  data: Uint8Array;
+  blockNumber: number;
+  logIndex: number;
+  sortKey: bigint;
 }
 
 interface RequestCompleted {
+  applicationId: bigint;
   requestId: string;
   status: number;
   errorCode: number;
@@ -363,25 +423,121 @@ interface RequestCompleted {
   applicationFees: bigint;
   blockNumber: number;
 }
+
+interface DeployRequestCompleted {  // emitted for submitDeployRequest completions
+  applicationId: bigint;
+  requestId: string;
+  applicationFees: bigint;
+  status: number;
+  errorCode: number;
+  errorMessage: string;
+  blockNumber: number;
+}
+
+interface OnChainRefund {
+  applicationId: bigint;
+  requestId: string;
+  to: string;
+  tokenAddress: string;           // 0x0 = ETH
+  amount: bigint;
+  blockNumber: number;
+}
+
+interface OnChainWithdrawal {
+  applicationId: bigint;
+  requestId: string;
+  to: string;
+  tokenAddress: string;           // 0x0 = ETH
+  amount: bigint;
+  blockNumber: number;
+}
+
+interface ClaimExecuted {           // emitted when a pending claim is pulled
+  tokenAddress: string;
+  payee: string;
+  amount: bigint;
+  blockNumber: number;
+}
 ```
 
 ---
 
-## Withdrawals (Pull Payments)
+## Deploying a WASM Application
 
-After a withdrawal is processed by the WASM application, the smart contract credits the destination address via pull-payment. The recipient must explicitly withdraw their funds:
+Deploys go through a dedicated endpoint (`submitDeployRequest`) — not `submitRequest`. The caller must hold `DEPLOYER_ROLE` on the `ProcessorEndpoint` contract. The payload is a JSON deploy descriptor that references the WASM artifact by its `sha256` (the artifact itself is uploaded out-of-band to the Authority Service beforehand):
 
 ```typescript
-// Check pending payments for an address
-const pending = await client.getPendingPayments(userAddress);
+import { PROTOCOL_VERSION } from "@horizen/vela-common-ts";
+
+const wasmBytes = await fetch("/payment_app.wasm").then(r => r.arrayBuffer());
+const wasmSha256 = new Uint8Array(
+  await crypto.subtle.digest("SHA-256", wasmBytes)
+);
+
+const receipt = await client.submitDeployRequestAndWaitForRequestId(
+  PROTOCOL_VERSION,
+  maxFee,
+  wasmSha256,
+  { /* optional constructor params, included in the deploy descriptor */ },
+);
+
+console.log("Deploy requestId:", receipt.requestId);
+
+// Wait for completion (uses the DeployRequestCompleted event, not RequestCompleted)
+const deployResult = await client.getDeployRequestCompletedEvent(
+  undefined,            // applicationId (unknown until completion)
+  receipt.requestId,
+  currentBlock,
+  deployBlock,
+);
+console.log("Assigned applicationId:", deployResult?.applicationId);
+```
+
+The contract derives a fresh `applicationId` from the request hash; you learn the value from the `DeployRequestCompleted` event.
+
+---
+
+## Application-level (Plaintext) Events
+
+Some apps emit non-encrypted, app-wide `AppEvent`s alongside per-user `UserEvent`s. These are queried separately:
+
+```typescript
+const appEvents = await client.getAppEvents(
+  currentBlock,                 // fromBlock (upper bound)
+  deployBlock,                  // toBlock (lower bound)
+  applicationId,
+  undefined,                    // requestId filter (or undefined)
+  "global_state_snapshot",      // eventSubType filter (or undefined)
+);
+
+for (const ev of appEvents) {
+  console.log(ev.eventSubType, ev.data);
+}
+```
+
+---
+
+## Withdrawals (Pull Payments / Claims)
+
+After a withdrawal is processed by the WASM application, the smart contract credits the destination address via pull-payment, tracked per token. The recipient must explicitly claim their funds:
+
+```typescript
+import { ETH_TOKEN } from "@horizen/vela-common-ts";
+
+// Check pending claims for an address (per token)
+const pending = await client.getPendingClaims(ETH_TOKEN, userAddress);
 console.log("Pending withdrawal:", pending, "wei");
 
-// Withdraw funds
+// Claim funds
 if (pending > 0n) {
-  const tx = await client.withdrawPayments(userAddress);
+  const tx = await client.claim(ETH_TOKEN, userAddress);
   await tx.wait();
-  console.log("Withdrawal completed");
+  console.log("Claim completed");
 }
+
+// For an ERC-20 token, pass its contract address instead of ETH_TOKEN
+// const erc20Pending = await client.getPendingClaims(erc20Address, userAddress);
+// await (await client.claim(erc20Address, userAddress)).wait();
 ```
 
 ---
@@ -399,7 +555,7 @@ import {
   importPublicKeyFromHex,
   stringToBytes,
   bytesToString,
-} from "vela-common-ts";
+} from "@horizen/vela-common-ts";
 
 // Encrypt a message for a known public key (ECDH + AES-256-GCM)
 const receiverPubKey = await importPublicKeyFromHex("04abcdef...");
@@ -447,7 +603,7 @@ import {
   bytesToHex,     // Uint8Array → "abcd" (no 0x prefix)
   stringToBytes,  // "hello" → Uint8Array (UTF-8)
   bytesToString,  // Uint8Array → "hello" (UTF-8)
-} from "vela-common-ts";
+} from "@horizen/vela-common-ts";
 ```
 
 ---
@@ -458,16 +614,21 @@ import {
 
 | Method | Description |
 |--------|-------------|
-| `submitRequest(...)` | Submit a request to the CCE (returns transaction response) |
-| `submitRequestAndWaitForRequestId(...)` | Submit and wait for request ID (returns `RequestReceipt`) |
+| `submitRequest(protocolVersion, applicationId, requestType, payload, tokenAddress, assetAmount, maxFeeValue)` | Submit a PROCESS / DEANONYMIZATION / ASSOCIATEKEY request (returns transaction response) |
+| `submitRequestAndWaitForRequestId(...)` | Same signature as `submitRequest`; waits for receipt and returns `RequestReceipt` |
+| `submitDeployRequest(protocolVersion, maxFeeValue, wasmSha256, constructorParams?)` | Submit a DEPLOYAPP request (caller must hold `DEPLOYER_ROLE`) |
+| `submitDeployRequestAndWaitForRequestId(...)` | Same as `submitDeployRequest`; returns `RequestReceipt` |
+| `approveToken(tokenAddress, amount)` | ERC-20 `approve` for the ProcessorEndpoint (required before non-ETH `submitRequest`) |
 | `encryptForTee(data)` | Encrypt data for the TEE using ECDH |
 | `getTeePublicKey()` | Get the TEE's P-521 public key from the contract |
 | `getSignerKeyPair()` | Derive the user's P-521 key pair from their wallet |
-| `getRequestCompletedEvent(requestId, fromBlock, toBlock)` | Query for request completion (returns `RequestResult`) |
-| `getCurrentUserEvents(fromBlock, toBlock, applicationId, eventSubType, filter, stopAtFirst)` | Get and decrypt events for current user |
+| `getRequestCompletedEvent(requestId, fromBlock, toBlock)` | Query for PROCESS/DEANONYMIZATION/ASSOCIATEKEY completion (returns `RequestResult`) |
+| `getDeployRequestCompletedEvent(applicationId?, requestId?, fromBlock, toBlock)` | Query for DEPLOYAPP completion |
+| `getCurrentUserEvents(fromBlock, toBlock, applicationId, requestId, eventSubType, filter, stopAtFirst)` | Get and decrypt per-user `UserEvent`s. `eventSubType` is a `bytes32` hex (use `ethers.encodeBytes32String`). |
+| `getAppEvents(fromBlock, toBlock, applicationId, requestId?, eventSubType?)` | Get plaintext application-level `AppEvent`s |
 | `decryptAndFilterEvents(events, filter, stopAtFirst)` | Decrypt and filter raw contract events |
-| `getPendingPayments(address)` | Check pending withdrawal balance for an address |
-| `withdrawPayments(payee)` | Execute withdrawal of pending payments |
+| `getPendingClaims(tokenAddress, payee)` | Check pending withdrawal balance per token for an address |
+| `claim(tokenAddress, payee)` | Execute pull-payment claim of pending balance |
 
 ### Crypto Exports
 
@@ -500,6 +661,19 @@ import {
 
 | Export | Value | Description |
 |--------|-------|-------------|
+| `PROTOCOL_VERSION` | `0` | Current on-chain protocol version expected by `submitRequest` / `submitDeployRequest` |
+| `ETH_TOKEN` | `ZeroAddress` | Sentinel `tokenAddress` value representing native ETH |
 | `CHALLENGE` | `"horizen"` | Default challenge prefix for key derivation |
 | `HKDF_SALT` | `Uint8Array(0)` | Default HKDF salt (empty) |
 | `HKDF_INFO` | `Uint8Array(0)` | Default HKDF info (empty) |
+| `SUBTYPE_KEY_MESSAGE` | `"subtype-key-v1"` | Message signed to derive the seed for privacy-preserving event sub-types |
+| `DEFAULT_SUBTYPE_N` | `50` | Number of HMAC-derived sub-types produced from a seed |
+
+### Seed / Subtype Helpers
+
+| Export | Description |
+|--------|-------------|
+| `generateSeed(signer, useAltSign?)` | Derive a seed from the wallet (uses `SUBTYPE_KEY_MESSAGE`) |
+| `encryptSeed(seed, teePublicKey, userPrivateKey)` | ECDH-encrypt the seed for inclusion in the 226-byte `ASSOCIATEKEY` payload |
+| `buildAssociateKeyPayload(userPublicKey, teePublicKey, seed)` | Build the 226-byte public-key + encrypted-seed payload |
+| `generateSubtypeSet(seed, n?)` | Produce `n` HMAC-derived sub-type strings from the seed |

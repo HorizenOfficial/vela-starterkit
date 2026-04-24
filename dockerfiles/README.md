@@ -5,7 +5,7 @@ It starts a dev chain using [Foundry Anvil](https://getfoundry.sh/anvil/overview
 
 - the TEE is only emulated (no real AWS Nitro Enclave is used, just a separate process)
 - only one single app deployment is supported - the app must have appId 1
-- based on Vela  0.0.25 tag
+- based on Vela  0.1.0 tag
 
 ## Instructions:
 
@@ -49,17 +49,22 @@ It starts a dev chain using [Foundry Anvil](https://getfoundry.sh/anvil/overview
 - **Contracts modified**: rebuild the deployer image, delete both volumes, and restart.
 
 ## Where to go next
-The system is up and running, but you need to deploy an app inside it.
+The system is up and running, and you can deploy an app on-chain via the descriptor flow. Each deploy derives its own `applicationId` from the on-chain `requestId`, so there is no need to rename the WASM file or reserve a fixed id.
 
-Currently only  a single-app manual deployment is supported:
-- the app wasm *must* be named *1.wasm* and put manually into the wasms/ folder before launching the deploy app command
-- launch a deploy app command with app id = 1 to initialize it
+Practical how-to for the `vela-nova` test app (Private transfer):
+- go to https://github.com/HorizenOfficial/vela-nova/releases/tag/v0.1.0 <br>
+*(look for 0.1.0 tag for a compatible version with this dev enviroment)*
+- download `payment_app.wasm` and `nova-linux` wallet
+- use the nova-linux wallet executable to submit the deploy and interact with the app:
 
-### Practical how-to for the vela-nova test app (Private transfer):
-- go to https://github.com/HorizenOfficial/vela-nova/releases/tag/v0.0.25 <br>
-*(look for 0.0.25 tag for a compatible version with this dev enviroment)*
-- download payment_app.wasm into the wasms/ folder and rename to 1.wasm
-- download the nova-linux wallet executable (linux environment only) locally to interact with the app.
+    ```
+    nova-linux deployapp --wasm /absolute/path/to/payment_app.wasm --max-value-fee "100 wei"
+    ```
+
+    The wallet uploads the WASM to the authority service (`POST /deploy/upload`) and submits the on-chain deploy request; the Manager picks it up, forwards the artifact to the Executor, and the TEE verifies the WASM fingerprint against the on-chain descriptor before loading the module.
+
+    If you submit deploys from a different wallet, grant it first the `DEPLOYAPP` role with the ProcessorEndpoint management script (`contracts/scripts/management/addAllowedDeployer.ts`) using the admin account.
+
 
     Use wallet.conf.template (rename it to wallet.conf) as wallet config file, with the following properties set to connect to this dev environment:
     
@@ -73,13 +78,13 @@ Currently only  a single-app manual deployment is supported:
     You  will need also to set two keys property:
     - keySecp256k1 property: you can use one of the private keys of the defaults Anvill accounts, which are pre-founded with 1000 ETH.
     - keyP521 (used for private communication with the TEE): you can generate one with: <br>
-    ./nova-linux generatkeys
+    ./nova-linux generatekeys
 
     Type "./nova-linux help" on a terminal to have an help on the wallet commands.
 
     You will need to deploy the app  first:
 
-    ./nova-linux deployapp 1
+    nova-linux deployapp --wasm /absolute/path/to/payment_app.wasm --max-value-fee "100 wei"
 
     Then you can try the following ones:
 
@@ -87,13 +92,14 @@ Currently only  a single-app manual deployment is supported:
     ./nova-linux getpublicbalance <br>
     ./nova-linux deposit -a "1 ETH" <br>
     ./nova-linux getprivatebalance <br>
+    ./nova-linux privatetransfer <br>
 
 
 
 ### Other useful repositories to look into:
 
 - https://github.com/HorizenOfficial/vela-common-ts <br>
-*(look for 0.0.25 tag for a compatible version with this dev enviroment)*
+*(look for 0.1.0 tag for a compatible version with this dev enviroment)*
 
     TypeScript library for interacting with Vela CCE (Confidential Computing Environment) smart contracts.<br>
     Provides P-521 ECDH encryption and a blockchain client optimized for browser applications.
