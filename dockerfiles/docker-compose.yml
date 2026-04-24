@@ -17,7 +17,7 @@ volumes:
 
 services:
   executor:
-    image: horizen/cce-executor:v0.0.25
+    image: horizen/cce-executor:v0.1.0
     container_name: vela-skit-executor
     restart: always
     privileged: true
@@ -49,7 +49,7 @@ services:
     depends_on:
       - chain
   manager:
-    image: horizen/cce-manager:v0.0.25
+    image: horizen/cce-manager:v0.1.0
     container_name: vela-skit-manager
     restart: always
     privileged: true
@@ -66,7 +66,6 @@ services:
       - MANAGER_KEY_SECP256
       - MANAGER_DATA_FOLDER=${MANAGER_DATA_FOLDER:-/data}
       - MANAGER_REPORTS_FOLDER=${MANAGER_REPORTS_FOLDER:-/reports}
-      - MANAGER_INPUT_WASMS
       # not set to a default, so if the .env does not set it (it is optional) Go app will not enable the feature
       - MANAGER_LOG_KIND
       - MANAGER_LOG_CONSOLE
@@ -104,8 +103,6 @@ services:
     volumes:
       - vela-skit-manager-data:${MANAGER_DATA_FOLDER:-/data}
       - vela-skit-manager-reports:${MANAGER_REPORTS_FOLDER:-/reports}
-      # WASM input folder
-      - ./wasms:${MANAGER_INPUT_WASMS:-/input_wasms}
       - vela-skit-logs:${LOG_SERVER_FOLDER:-/logs}
       - vela-skit-deploy-data:/deploy-data:ro
     depends_on:
@@ -114,7 +111,7 @@ services:
       deployer:
         condition: service_completed_successfully
   authorityservice:
-    image: horizen/cce-authorityservice:v0.0.25
+    image: horizen/cce-authorityservice:v0.1.0
     container_name: vela-skit-authorityservice
     restart: always
     ports:
@@ -149,7 +146,7 @@ services:
       subgraph-deployer:
         condition: service_completed_successfully
   chain:
-    image: horizen/cce-chain:v0.0.25
+    image: horizen/cce-chain:v0.1.0
     container_name: vela-skit-chain
     restart: always
     environment:
@@ -164,7 +161,7 @@ services:
     volumes:
       - vela-skit-chain-data:${CHAIN_DATA_FOLDER:-/data}
   deployer:
-    image: horizen/cce-deployer:v0.0.25
+    image: horizen/cce-deployer:v0.1.0
     container_name: vela-skit-deployer
     restart: "no"
     environment:
@@ -265,7 +262,7 @@ services:
       retries: 30
       start_period: 20s
   subgraph-deployer:
-    image: horizen/cce-subgraph-deployer:v0.0.25
+    image: horizen/cce-subgraph-deployer:v0.1.0
     container_name: vela-skit-subgraph-deployer
     restart: "no"
     environment:

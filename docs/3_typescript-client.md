@@ -1,4 +1,4 @@
-# Vela TypeScript Client Library (v0.0.25)
+# Vela TypeScript Client Library (v0.1.0)
 
 The `@horizen/vela-common-ts` library provides everything a browser application needs to interact with the Vela CCE platform: key derivation from a wallet, payload encryption, request submission, event decryption, and withdrawal collection. It is designed for browser environments using the Web Crypto API.
 
@@ -315,13 +315,16 @@ Events are the primary way the application communicates results back to users. E
 ### Option A: Direct Contract Query
 
 ```typescript
+import { encodeBytes32String } from "ethers";
+
 const events = await client.getCurrentUserEvents(
-  currentBlock,     // fromBlock (upper bound)
-  deployBlock,      // toBlock (lower bound)
+  currentBlock,                        // fromBlock (upper bound)
+  deployBlock,                         // toBlock (lower bound)
   applicationId,
-  "deposit",        // eventSubType filter (or undefined for all)
-  (data) => true,   // filter function on decrypted payload
-  false             // stopAtFirst
+  undefined,                           // requestId filter (or undefined)
+  encodeBytes32String("deposit"),      // eventSubType — must be a bytes32 hex (or undefined for all)
+  (data) => true,                      // filter function on decrypted payload
+  false                                // stopAtFirst
 );
 
 for (const eventBytes of events) {
@@ -330,6 +333,8 @@ for (const eventBytes of events) {
   // { type: "deposit", amount: "0x...", balance: "0x...", nonce: 1 }
 }
 ```
+
+> `eventSubType` in both the contract events (`UserEvent` / `AppEvent`) and the subgraph is an indexed `bytes32`. Pass a bytes32 hex string when querying — `ethers.encodeBytes32String(label)` packs a short ASCII label; use `ethers.decodeBytes32String(hex)` to read one back.
 
 The client internally:
 1. Queries `UserEvent` logs from the `ProcessorEndpoint` contract
@@ -365,15 +370,17 @@ const teePublicKey = await importPublicKeyFromHex(teePublicKeyHex);
 // Get user's private key
 const keyPair = await client.getSignerKeyPair();
 
-// Fetch and decrypt events
+// Fetch and decrypt events — eventSubType must be a bytes32 hex
+import { encodeBytes32String } from "ethers";
+
 const events = await fetchAndDecryptUserEvents(
   subgraph,
   teePublicKey,
   keyPair.privateKey,
   applicationId,
-  "transfer_received",   // eventSubType filter
-  10,                     // limit (0 = no limit)
-  (data) => true          // optional filter on decrypted payload
+  encodeBytes32String("transfer_received"), // eventSubType filter (bytes32 hex)
+  10,                                        // limit (0 = no limit)
+  (data) => true                             // optional filter on decrypted payload
 );
 
 for (const eventBytes of events) {
@@ -617,7 +624,7 @@ import {
 | `getSignerKeyPair()` | Derive the user's P-521 key pair from their wallet |
 | `getRequestCompletedEvent(requestId, fromBlock, toBlock)` | Query for PROCESS/DEANONYMIZATION/ASSOCIATEKEY completion (returns `RequestResult`) |
 | `getDeployRequestCompletedEvent(applicationId?, requestId?, fromBlock, toBlock)` | Query for DEPLOYAPP completion |
-| `getCurrentUserEvents(fromBlock, toBlock, applicationId, eventSubType, filter, stopAtFirst)` | Get and decrypt per-user `UserEvent`s |
+| `getCurrentUserEvents(fromBlock, toBlock, applicationId, requestId, eventSubType, filter, stopAtFirst)` | Get and decrypt per-user `UserEvent`s. `eventSubType` is a `bytes32` hex (use `ethers.encodeBytes32String`). |
 | `getAppEvents(fromBlock, toBlock, applicationId, requestId?, eventSubType?)` | Get plaintext application-level `AppEvent`s |
 | `decryptAndFilterEvents(events, filter, stopAtFirst)` | Decrypt and filter raw contract events |
 | `getPendingClaims(tokenAddress, payee)` | Check pending withdrawal balance per token for an address |

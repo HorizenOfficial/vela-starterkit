@@ -1,4 +1,4 @@
-# Building a Private Transfer App on Vela (v0.0.25)
+# Building a Private Transfer App on Vela (v0.1.0)
 
 This document walks through the implementation of a real WASM application for the Vela CCE platform: a **private transfer app** that supports deposits, account-to-account transfers, withdrawals to external addresses, and regulatory deanonymization. It serves as a practical reference for developers building their own applications.
 It shows some code snippets in GO language.
@@ -8,7 +8,7 @@ It shows some code snippets in GO language.
 App code is available in the following repository:
 
 https://github.com/HorizenOfficial/vela-nova <br>
-*(this guide is based on v0.0.25 tag)*
+*(this guide is based on v0.1.0 tag)*
 
 
 
@@ -53,8 +53,8 @@ The app references the main vela repository and the shared WASM types library:
 
 ```
 require (
-    github.com/HorizenOfficial/vela v0.0.25
-    github.com/HorizenOfficial/vela-common-go v0.0.25
+    github.com/HorizenOfficial/vela v0.1.0
+    github.com/HorizenOfficial/vela-common-go v0.1.0
 )
 ```
 
@@ -91,31 +91,58 @@ All application state is serialized to JSON, encrypted by the Executor (AES-256)
 ```go
 // ApplicationInternalState is the root state container.
 type ApplicationInternalState struct {
-    AppID    uint64                   `json:"appId"`
-    Accounts map[string]*AccountState `json:"accounts"`
-    Nonce    uint64                   `json:"nonce"`
+    AppID         uint64                   `json:"appId"`
+    Accounts      map[string]*AccountState `json:"accounts"`
+    AllowedTokens map[string]bool          `json:"allowedTokens"` // token address hex -> allowed
+    Nonce         uint64                   `json:"nonce"`
+    Transactions  []TransactionRecord      `json:"transactions,omitempty"`
 }
 
-// AccountState represents a single user account.
+// AccountState represents a single user account with per-token balances.
 type AccountState struct {
-    Address types.Address  `json:"address"`
-    Balance *types.Uint256 `json:"balance"`
+    Address  types.Address             `json:"address"`
+    Balances map[string]*types.Uint256 `json:"balances"` // token address hex -> balance
+}
+
+// TransactionRecord is an in-state audit log entry appended on every
+// state-changing operation. A bounded ring buffer (`MaxTransactions = 50`)
+// is used to cap state growth.
+type TransactionRecord struct {
+    Type         string         `json:"type"` // "deposit", "transfer", "withdrawal"
+    From         types.Address  `json:"from"`
+    To           types.Address  `json:"to"`
+    TokenAddress types.Address  `json:"tokenAddress"`
+    Amount       *types.Uint256 `json:"amount"`
+    Nonce        uint64         `json:"nonce"`
+    Timestamp    int64          `json:"timestamp"`
+    InvoiceID    string         `json:"invoice_id,omitempty"`
+}
+
+// DeployParams carries the constructor parameters the app receives via
+// the `deploy` export — in this app, the initial ERC-20 token allowlist.
+// ETH (address(0)) is always allowed implicitly.
+type DeployParams struct {
+    AllowedTokens []string `json:"allowedTokens"`
 }
 ```
 
 Design choices:
 - **Accounts keyed by hex string** (e.g., `"0xadd...01"`). This avoids issues with binary map keys in JSON serialization.
+- **Per-token balances** — an account holds one balance per token address (`"0x00…00"` for ETH, ERC-20 contract address otherwise). The set of accepted tokens is narrowed further by the app's own `AllowedTokens` map, seeded by constructor params at deploy time.
 - **Global nonce** incremented on every state-changing operation. Included in events so clients can verify ordering.
-- **`types.Uint256`** for balances — provided by `vela-common-go/wasm/types`. A 256-bit unsigned integer (`[4]uint64`) that matches Ethereum's native precision. Supports `Add`, `Sub`, `Cmp`, `AddOverflow`, and `IsZero`.
+- **In-state transaction log** (`Transactions`) — a bounded ring buffer (cap `MaxTransactions = 50`) maintained so a deanonymization report can include recent activity. Old entries are dropped on overflow.
+- **`types.Uint256`** for balances — provided by `vela-common-go/wasm/types`. A 256-bit unsigned integer (`[4]uint64`) that matches Ethereum's native precision. Supports `Add`, `Sub`, `Cmp`, `AddOverflow`, `SubOverflow`, and `IsZero`.
 - **`types.Address`** — provided by `vela-common-go/wasm/types`. A `[20]byte` type (not `go-ethereum`'s `common.Address`). JSON serialization produces the same `"0x..."` format, ensuring compatibility with the host.
 
 ---
 
 ## Step 3: Implement the WASM Exports
 
-Your module must export these functions: `load_module`, `deposit`, `process_request`, plus `allocate`/`deallocate` (provided by `vela-common-go/wasm/utils`).
+Your module must export these functions: `deploy`, `load_module`, `deposit`, `process_request`, plus `allocate`/`deallocate` (provided by `vela-common-go/wasm/utils`).
 
-> **Change from v0.0.18**: The `generate_deanonymization_report` export has been removed. Deanonymization is now handled inside `process_request` via the new `requestType` parameter.
+> **Change from v0.0.18**: The `generate_deanonymization_report` export has been removed. Deanonymization is now handled inside `process_request` via the `requestType` parameter.
+>
+> **Change from v0.0.25**: A new `deploy` export receives JSON-encoded constructor parameters (the `constructorParams` field of the deploy descriptor). `load_module` is retained for cache warm-up on Executor restart — new deployments go through `deploy`.
 
 ### main.go — The Bridge Layer
 
@@ -128,6 +155,13 @@ import (
     "github.com/HorizenOfficial/vela-nova/payment-app/app"
 )
 
+//export deploy
+func deploy(appId int64, paramsPtr *byte, paramsLen int32) *byte {
+    paramsJSON := utils.PtrToString(paramsPtr, paramsLen)
+    result := app.Deploy(appId, paramsJSON)
+    return types.SerializeAndWriteResult(result)
+}
+
 //export load_module
 func load_module(appId int64) *byte {
     result := app.LoadModule(appId)
@@ -136,13 +170,15 @@ func load_module(appId int64) *byte {
 
 //export deposit
 func deposit(appId int64, senderPtr *byte, senderLen int32,
+             tokenPtr *byte, tokenLen int32,
              valuePtr *byte, valueLen int32,
              statePtr *byte, stateLen int32) *byte {
     _ = appId
     sender := types.PtrToAddress(senderPtr, senderLen)
+    token := types.PtrToAddress(tokenPtr, tokenLen)
     stateJSON := utils.PtrToString(statePtr, stateLen)
     value := types.PtrToUint256(valuePtr, valueLen)
-    result := app.DepositFunds(sender, value, stateJSON)
+    result := app.DepositFunds(sender, token, value, stateJSON)
     return types.SerializeAndWriteResult(result)
 }
 
@@ -172,6 +208,8 @@ Key patterns:
 - Use `types.PtrToAddress`, `types.PtrToUint256`, `utils.PtrToString` to convert WASM pointers into Go types. These are now imported from `vela-common-go`.
 - Always return via `types.SerializeAndWriteResult(result)` — this serializes your result to JSON and writes it into WASM linear memory for the host to read (4-byte little-endian length prefix + data).
 - The `//export` directive is required for TinyGo to expose the function to the host.
+- **`deploy` receives constructor params** as JSON. The app unmarshals them into a `DeployParams` struct and builds the initial state (here, seeding the ERC-20 token allowlist).
+- **`deposit` receives a `tokenPtr`** identifying which token is being deposited (`0x0` for native ETH, otherwise the ERC-20 contract address that the on-chain `TokenAllowlist` has whitelisted).
 - **`process_request` receives a `requestType int32` parameter** — the app uses this to determine the operation (e.g., standard processing vs. deanonymization). Both `PROCESS` and `DEANONYMIZATION` requests go through this single export.
 - **`ASSOCIATEKEY` requests** are handled entirely by the Executor and never reach the WASM module.
 
@@ -179,22 +217,52 @@ Key patterns:
 
 ## Step 4: Implement Business Logic
 
-### LoadModule — Initialization
+### Deploy — Initialization with Constructor Params
 
-Called once when the application is deployed on-chain. Returns the initial empty state.
+Called once when the application is deployed on-chain (via `submitDeployRequest`). Receives the JSON-encoded `constructorParams` from the deploy descriptor and returns the initial state.
+
+```go
+func Deploy(appId int64, paramsJSON string) types.DeployResult {
+    allowedTokens := map[string]bool{ethTokenHex: true} // ETH always allowed
+
+    if paramsJSON != "" {
+        var params DeployParams
+        if err := json.Unmarshal([]byte(paramsJSON), &params); err != nil {
+            return types.DeployResult{Error: fmt.Sprintf("failed to parse deploy params: %v", err)}
+        }
+        for _, tokenHex := range params.AllowedTokens {
+            if _, err := types.HexToAddress(tokenHex); err != nil {
+                return types.DeployResult{Error: fmt.Sprintf("invalid token address %q: %v", tokenHex, err)}
+            }
+            allowedTokens[tokenHex] = true
+        }
+    }
+
+    initialState := &ApplicationInternalState{
+        AppID:         uint64(appId),
+        Accounts:      make(map[string]*AccountState),
+        AllowedTokens: allowedTokens,
+    }
+    stateJSON, _ := json.Marshal(initialState)
+    return types.DeployResult{
+        State: stateJSON,
+        Fuel:  types.NewUint256(5),
+    }
+}
+```
+
+### LoadModule — Cache Warm-Up Fallback
+
+Called by the Executor on restart to rebuild the default-initial-state cache entry without re-running the constructor. Returns the same minimal state as `Deploy` with no constructor input (ETH-only allowlist). Apps never need to call this themselves.
 
 ```go
 func LoadModule(appId int64) types.LoadModuleResult {
     initialState := &ApplicationInternalState{
-        AppID:    uint64(appId),
-        Accounts: make(map[string]*AccountState),
+        AppID:         uint64(appId),
+        Accounts:      make(map[string]*AccountState),
+        AllowedTokens: map[string]bool{ethTokenHex: true},
     }
-    stateJSON, err := json.Marshal(initialState)
-    if err != nil {
-        return types.LoadModuleResult{
-            Error: fmt.Sprintf("failed to marshal initial state: %v", err),
-        }
-    }
+    stateJSON, _ := json.Marshal(initialState)
     return types.LoadModuleResult{
         State: stateJSON,
         Fuel:  types.NewUint256(5),
@@ -204,71 +272,87 @@ func LoadModule(appId int64) types.LoadModuleResult {
 
 ### Deposit — Funding Accounts
 
-Called when a user submits a request with a deposit amount. The Executor calls `deposit()` before `process_request()` if the request includes funds.
+Called when a user submits a request with a non-zero `assetAmount`. The Executor calls `deposit()` before `process_request()` if the request includes funds. The `tokenPtr` argument identifies which token is being deposited (ETH sentinel `0x0` or an ERC-20 address).
 
 ```go
-func DepositFunds(senderPtr *Address, value *Uint256, stateJSON string) DepositResult {
+func DepositFunds(senderPtr, tokenPtr *types.Address, value *types.Uint256, stateJSON string) types.DepositResult {
     // 1. Validate inputs
     if senderPtr == nil {
-        return DepositResult{Error: "Sender address is nil"}
+        return types.DepositResult{Error: "Sender address is nil"}
+    }
+    if tokenPtr == nil {
+        return types.DepositResult{Error: "Token address is nil"}
     }
     if value == nil {
-        return DepositResult{Error: "value is nil"}
+        return types.DepositResult{Error: "value is nil"}
     }
 
     senderHex := senderPtr.Hex()
+    tokenHex := resolveTokenHex(*tokenPtr) // "0x00…00" for ETH
 
     // 2. Deserialize state
     var currentState ApplicationInternalState
     if err := json.Unmarshal([]byte(stateJSON), &currentState); err != nil {
-        return DepositResult{Error: fmt.Sprintf("Failed to parse application state: %v", err)}
+        return types.DepositResult{Error: fmt.Sprintf("Failed to parse application state: %v", err)}
     }
 
-    var events []PlainEvent
+    // 3. Enforce the app-level allowlist (ETH always, ERC-20 only if deploy-time opted in)
+    if !currentState.AllowedTokens[tokenHex] {
+        return types.DepositResult{Error: fmt.Sprintf("Token %s not allowed by this application", tokenHex)}
+    }
 
-    // 3. Process deposit (skip zero-value deposits)
+    var events []types.PlainEvent
+
+    // 4. Process deposit (skip zero-value deposits)
     if !value.IsZero() {
         // Create account if it doesn't exist
         if currentState.Accounts[senderHex] == nil {
             currentState.Accounts[senderHex] = &AccountState{
-                Address: *senderPtr,
-                Balance: NewUint256(0),
+                Address:  *senderPtr,
+                Balances: make(map[string]*types.Uint256),
             }
         }
 
+        balance := getOrCreateTokenBalance(currentState.Accounts[senderHex], tokenHex)
+
         // Add to balance with overflow check
-        oldBalance := *currentState.Accounts[senderHex].Balance
-        if currentState.Accounts[senderHex].Balance.AddOverflow(
-            *currentState.Accounts[senderHex].Balance, *value) {
-            *currentState.Accounts[senderHex].Balance = oldBalance
-            return DepositResult{Error: fmt.Sprintf("Overflow while adding amount %s to balance: %s",
+        oldBalance := *balance
+        if balance.AddOverflow(*balance, *value) {
+            *balance = oldBalance
+            return types.DepositResult{Error: fmt.Sprintf("Overflow while adding amount %s to balance: %s",
                 value, oldBalance)}
         }
 
         currentState.Nonce++
+        recordTransaction(&currentState, "deposit", *senderPtr, *senderPtr, *tokenPtr, value, "")
 
-        // 4. Emit event to the depositor
+        // 5. Emit event to the depositor (DepositEvent fields include tokenAddress + balance)
         eventData, _ := json.Marshal(DepositEvent{
-            Type: "deposit", Amount: value,
-            Balance: currentState.Accounts[senderHex].Balance,
-            Nonce: currentState.Nonce,
+            Type: "deposit", TokenAddress: *tokenPtr, Amount: value,
+            Balance: balance, Nonce: currentState.Nonce,
         })
-        events = append(events, PlainEvent{
-            UserID:       *senderPtr,
-            EventSubType: "deposit",
-            Data:         eventData,
+        // EventSubType is intentionally left unset. The payment app assumes
+        // users register a subtype seed at ASSOCIATEKEY time, and the Executor
+        // overrides PlainEvent subtypes with an HMAC-derived value from that
+        // seed (any value set here would be discarded). The Type discriminator
+        // is carried inside the encrypted Data payload.
+        events = append(events, types.PlainEvent{
+            UserID: *senderPtr,
+            Data:   eventData,
         })
     }
 
-    // 5. Return updated state
+    // 6. Return updated state
     newStateBytes, _ := json.Marshal(&currentState)
-    return DepositResult{
+    return types.DepositResult{
         State:  newStateBytes,
         Events: events,
-        Fuel:   NewUint256(35),
+        Fuel:   types.NewUint256(35),
     }
 }
 ```
+
+> **`EventSubType` is a `[32]byte`**, not a string. If the target user registered a subtype seed during `ASSOCIATEKEY` (226-byte payload), the Executor overrides whatever the app writes here with an HMAC-derived opaque subtype drawn from the user's seed — so the private transfer app deliberately leaves `EventSubType` zero. If no seed is registered, the Executor preserves the app-supplied value, and apps can pack short ASCII labels into the first bytes (`[32]byte{'d','e','p','o','s','i','t',0,…}`). The plaintext `Type` discriminator (`"deposit"`, `"transfer_sent"`, …) is carried inside the encrypted event data. See `SUBTYPE_KEY_MESSAGE` in the TypeScript client guide for the seed derivation.
 
 ### ProcessRequest — Transfers, Withdrawals, and Deanonymization
 
@@ -325,99 +409,186 @@ func ProcessRequest(senderPtr *types.Address, requestType int32, payloadJSON, st
 
 #### Transfer
 
-Moves funds between two accounts within the app. Both sender and recipient receive encrypted events. Transfers support an optional `InvoiceID` field (max 100 characters) for payment tracking.
+Moves funds between two accounts within the app, for a specific token. Both sender and recipient receive encrypted events. Transfers support an optional `InvoiceID` field (max 100 characters) for payment tracking and an optional `TokenAddress` (defaults to ETH `0x0`).
 
 ```go
 case "transfer":
-    // Validate sender has sufficient balance
+    tokenHex := resolveTokenHex(instructions.Transfer.TokenAddress)
+    if !currentState.AllowedTokens[tokenHex] {
+        return types.ProcessResult{Error: fmt.Sprintf("Token %s not allowed", tokenHex)}
+    }
+
+    // Validate sender has sufficient balance in the chosen token
     if currentState.Accounts[senderHex] == nil {
         return types.ProcessResult{Error: fmt.Sprintf("Account %s does not exist!", senderHex)}
     }
-    if currentState.Accounts[senderHex].Balance.Cmp(*instructions.Transfer.Amount) < 0 {
+    senderBalance := getOrCreateTokenBalance(currentState.Accounts[senderHex], tokenHex)
+    if senderBalance.Cmp(*instructions.Transfer.Amount) < 0 {
         return types.ProcessResult{Error: "Insufficient balance for transfer"}
     }
 
     recipientHex := instructions.Transfer.To.Hex()
-
-    // Create recipient account if needed
     if currentState.Accounts[recipientHex] == nil {
         currentState.Accounts[recipientHex] = &AccountState{
-            Address: instructions.Transfer.To,
-            Balance: types.NewUint256(0),
+            Address:  instructions.Transfer.To,
+            Balances: make(map[string]*types.Uint256),
         }
     }
+    recipientBalance := getOrCreateTokenBalance(currentState.Accounts[recipientHex], tokenHex)
 
     // Execute transfer (save balances for revert on overflow)
-    oldSenderBalance := *currentState.Accounts[senderHex].Balance
-    oldRecipientBalance := *currentState.Accounts[recipientHex].Balance
+    oldSenderBalance := *senderBalance
+    oldRecipientBalance := *recipientBalance
 
-    currentState.Accounts[senderHex].Balance.Sub(
-        *currentState.Accounts[senderHex].Balance, *instructions.Transfer.Amount)
-    if currentState.Accounts[recipientHex].Balance.AddOverflow(
-        *currentState.Accounts[recipientHex].Balance, *instructions.Transfer.Amount) {
+    senderBalance.Sub(*senderBalance, *instructions.Transfer.Amount)
+    if recipientBalance.AddOverflow(*recipientBalance, *instructions.Transfer.Amount) {
         // Revert both balances on overflow
-        *currentState.Accounts[senderHex].Balance = oldSenderBalance
-        *currentState.Accounts[recipientHex].Balance = oldRecipientBalance
+        *senderBalance = oldSenderBalance
+        *recipientBalance = oldRecipientBalance
         return types.ProcessResult{Error: "Overflow while adding transfer amount"}
     }
     currentState.Nonce++
+    recordTransaction(&currentState, "transfer", sender, instructions.Transfer.To,
+        instructions.Transfer.TokenAddress, instructions.Transfer.Amount, instructions.Transfer.InvoiceID)
 
-    // Two events: one for sender, one for recipient (InvoiceID included if present)
+    // Two events: one for sender, one for recipient (InvoiceID included if present).
+    // EventSubType is left unset — see the note in DepositFunds; the Executor
+    // fills it in from each recipient's registered seed.
     events = append(events,
-        types.PlainEvent{UserID: sender, EventSubType: "transfer_sent", Data: ...},
-        types.PlainEvent{UserID: instructions.Transfer.To, EventSubType: "transfer_received", Data: ...},
+        types.PlainEvent{UserID: sender,                    Data: ...},
+        types.PlainEvent{UserID: instructions.Transfer.To,  Data: ...},
     )
+
+    // Optional: if the transfer carries an InvoiceID, emit a plaintext
+    // AppEvent whose EventSubType is a deterministic Keccak256 hash over
+    // (lenPrefix || InvoiceID || sender || tokenAddress || amount || recipient).
+    // Data is nil — the subtype itself is the verifiable receipt anyone can
+    // recompute and look up on-chain (indexed bytes32 topic).
+    if instructions.Transfer.InvoiceID != "" {
+        invoiceIDBytes := []byte(instructions.Transfer.InvoiceID)
+        var lenPrefix [4]byte
+        binary.BigEndian.PutUint32(lenPrefix[:], uint32(len(invoiceIDBytes)))
+
+        h := sha3.NewLegacyKeccak256()
+        h.Write(lenPrefix[:])
+        h.Write(invoiceIDBytes)
+        h.Write(sender[:])
+        h.Write(instructions.Transfer.TokenAddress[:])
+        h.Write(instructions.Transfer.Amount.Bytes())
+        h.Write(instructions.Transfer.To[:])
+
+        var receiptSubType [32]byte
+        copy(receiptSubType[:], h.Sum(nil))
+
+        appEvents = append(appEvents, types.AppEvent{
+            EventSubType: receiptSubType,
+            Data:         nil,
+        })
+    }
 ```
 
-The Executor encrypts each event with the target user's P-521 public key. The sender sees `transfer_sent`; the recipient sees `transfer_received`. External observers see nothing — they only know a request was processed.
+The Executor encrypts each event with the target user's P-521 public key. The sender sees `transfer_sent`; the recipient sees `transfer_received` (both discriminated by the `Type` field inside the encrypted data). External observers see nothing about the private transfer itself — they only know a request was processed, plus the optional receipt topic when an `InvoiceID` is present. The receipt hash is collision-resistant on its inputs (length-prefixed `InvoiceID`, fixed 20-byte addresses, fixed 32-byte big-endian `Amount`) and lets a third party verify "this transfer happened" by recomputing the subtype from the transfer parameters.
 
 #### Withdrawal
 
-Removes funds from the app and instructs the smart contract to release them on-chain.
+Removes funds from the app and instructs the smart contract to release them on-chain. The optional `TokenAddress` in the instruction selects which token to withdraw (ETH by default).
 
 ```go
 case "withdraw":
-    if currentState.Accounts[senderHex] == nil {
-        return ProcessResult{Error: fmt.Sprintf("Account %s does not exist", senderHex)}
+    tokenHex := resolveTokenHex(instructions.Withdraw.TokenAddress)
+    if !currentState.AllowedTokens[tokenHex] {
+        return types.ProcessResult{Error: fmt.Sprintf("Token %s not allowed", tokenHex)}
     }
-    if currentState.Accounts[senderHex].Balance.Cmp(*instructions.Withdraw.Amount) < 0 {
-        return ProcessResult{Error: fmt.Sprintf("Insufficient balance %s for withdrawal %s",
-            currentState.Accounts[senderHex].Balance, *instructions.Withdraw.Amount)}
+    if currentState.Accounts[senderHex] == nil {
+        return types.ProcessResult{Error: fmt.Sprintf("Account %s does not exist", senderHex)}
+    }
+    senderBalance := getOrCreateTokenBalance(currentState.Accounts[senderHex], tokenHex)
+    if senderBalance.Cmp(*instructions.Withdraw.Amount) < 0 {
+        return types.ProcessResult{Error: fmt.Sprintf("Insufficient balance %s for withdrawal %s",
+            senderBalance, *instructions.Withdraw.Amount)}
     }
 
-    currentState.Accounts[senderHex].Balance.Sub(
-        *currentState.Accounts[senderHex].Balance, *instructions.Withdraw.Amount)
+    senderBalance.Sub(*senderBalance, *instructions.Withdraw.Amount)
     currentState.Nonce++
+    recordTransaction(&currentState, "withdrawal", sender, instructions.Withdraw.To,
+        instructions.Withdraw.TokenAddress, instructions.Withdraw.Amount, "")
 
     // Withdrawal instruction — processed by the smart contract.
-    // TokenAddress is left zero here (defaults to native ETH). For ERC-20
-    // withdrawals, set TokenAddress to the token contract address.
-    withdrawals = append(withdrawals, Withdrawal{
+    // TokenAddress selects the custody pool; the contract credits the
+    // destination via pull-payment per token (`claim(tokenAddress, payee)`).
+    withdrawals = append(withdrawals, types.Withdrawal{
+        TokenAddress:       instructions.Withdraw.TokenAddress, // 0x0 = ETH
         DestinationAddress: instructions.Withdraw.To,
         Amount:             instructions.Withdraw.Amount,
     })
 
-    // Event for the sender
-    events = append(events, PlainEvent{
-        UserID: sender, EventSubType: "withdrawal", Data: ...,
+    // Event for the sender (EventSubType left unset — see DepositFunds)
+    events = append(events, types.PlainEvent{
+        UserID: sender, Data: ...,
     })
 ```
 
-`Withdrawal` entries are included in the signed update payload. The smart contract verifies the TEE signature and credits the destination address via pull-payment.
+`Withdrawal` entries are included in the signed update payload. The smart contract verifies the TEE signature and credits the destination address via pull-payment per token.
 
 #### Deanonymization (inside ProcessRequest)
 
 When `requestType == common.Deanonymize`, the app generates a report and returns it in `ProcessResult.Report`. The state is **not modified** — the original state JSON is returned as-is to avoid unnecessary marshalling.
 
+The reference app supports two report types, selected by the `reportType` field inside the payload (defaults to `"balances"` when the payload is empty or omits the field):
+
+| `reportType` | Shape | Contents |
+|---|---|---|
+| `"balances"` (default) | `DeanonymizationReport{Accounts, Nonce}` | Full snapshot of all accounts' per-token balances and the current state nonce. |
+| `"tx_history"` | `TxHistoryReport{Address, Balances, Transactions}` | The target `Address`'s current per-token balances plus all in-state transaction records involving it, optionally filtered to the `[FromTimestamp, ToTimestamp]` window. |
+
 ```go
 case "deanonymize":
-    report := DeanonymizationReport{
-        Accounts: currentState.Accounts,
-        Nonce:    currentState.Nonce,
+    reportType := "balances"
+    if instructions.Deanonymize != nil && instructions.Deanonymize.ReportType != "" {
+        reportType = instructions.Deanonymize.ReportType
     }
-    reportBytes, err := json.Marshal(report)
-    if err != nil {
-        return types.ProcessResult{Error: fmt.Sprintf("Failed to serialize deanonymization report: %v", err)}
+
+    var reportBytes []byte
+    switch reportType {
+    case "balances":
+        reportBytes, _ = json.Marshal(DeanonymizationReport{
+            Accounts: currentState.Accounts,
+            Nonce:    currentState.Nonce,
+        })
+    case "tx_history":
+        if instructions.Deanonymize.Address.IsZero() {
+            return types.ProcessResult{Error: "tx_history report requires a non-zero address"}
+        }
+        addr := instructions.Deanonymize.Address
+        fromTs := instructions.Deanonymize.FromTimestamp
+        toTs   := instructions.Deanonymize.ToTimestamp
+
+        filtered := []TransactionRecord{}
+        for _, tx := range currentState.Transactions {
+            if tx.From != addr && tx.To != addr {
+                continue
+            }
+            if fromTs > 0 && tx.Timestamp < fromTs {
+                continue
+            }
+            if toTs > 0 && tx.Timestamp > toTs {
+                break
+            }
+            filtered = append(filtered, tx)
+        }
+
+        balances := map[string]*types.Uint256{}
+        if acc := currentState.Accounts[addr.Hex()]; acc != nil && acc.Balances != nil {
+            balances = acc.Balances
+        }
+
+        reportBytes, _ = json.Marshal(TxHistoryReport{
+            Address:      addr,
+            Balances:     balances,
+            Transactions: filtered,
+        })
+    default:
+        return types.ProcessResult{Error: fmt.Sprintf("Unsupported report type: %s", reportType)}
     }
 
     return types.ProcessResult{
@@ -443,12 +614,13 @@ Here are the payload formats your app defines:
   "type": "transfer",
   "transfer": {
     "to": "0x1234567890abcdef1234567890abcdef12345678",
+    "tokenAddress": "0x0000000000000000000000000000000000000000",
     "amount": "0x6f05b59d3b20000",
     "invoice_id": "INV-2025-001"
   }
 }
 ```
-The `invoice_id` field is optional (max 100 characters). It is included in both sender and recipient events for payment tracking.
+The `tokenAddress` field is optional and defaults to ETH (`0x0`) if omitted; for an ERC-20 transfer, set it to the token contract address (must be in the app's `AllowedTokens`). The `invoice_id` field is optional (max 100 characters): it is included in both sender and recipient events for payment tracking, and also triggers emission of a plaintext `AppEvent` whose indexed `eventSubType` is a Keccak256 receipt over `(len(invoice_id) || invoice_id || sender || tokenAddress || amount || recipient)` — a public, verifiable proof that the transfer happened, without revealing balances.
 
 **Withdrawal:**
 ```json
@@ -456,16 +628,40 @@ The `invoice_id` field is optional (max 100 characters). It is included in both 
   "type": "withdraw",
   "withdraw": {
     "to": "0x1234567890abcdef1234567890abcdef12345678",
+    "tokenAddress": "0x0000000000000000000000000000000000000000",
     "amount": "0x6f05b59d3b20000"
   }
 }
 ```
+`tokenAddress` is optional; defaults to ETH if omitted.
 
 **Deanonymization:**
+
+Empty payload (defaults to a full `"balances"` snapshot):
 ```json
 {}
 ```
-For deanonymization, the payload can be an empty JSON object. The `requestType` parameter (set by the Executor to `2`) determines the routing — the app checks `requestType == common.Deanonymize` and generates a report regardless of payload content.
+
+Explicit balances report (same as the default):
+```json
+{
+  "deanonymize": { "reportType": "balances" }
+}
+```
+
+Transaction-history report for one address, optionally time-windowed:
+```json
+{
+  "deanonymize": {
+    "reportType": "tx_history",
+    "address": "0x1234567890abcdef1234567890abcdef12345678",
+    "fromTimestamp": 1700000000,
+    "toTimestamp":   1710000000
+  }
+}
+```
+
+The `requestType` parameter (set by the Executor to `2`) determines routing — the app checks `requestType == common.Deanonymize` and generates a report regardless of payload content. The payload fields above just select **which** report. `address` is required for `tx_history`; `fromTimestamp`/`toTimestamp` are optional (`0` = unbounded).
 
 ---
 
@@ -479,33 +675,38 @@ Here are the payload formats your app defines:
 
 ### Event Types
 
-| EventSubType | Recipient | Data Fields |
-|--------------|-----------|-------------|
-| `deposit` | Depositor | `type`, `amount`, `balance`, `nonce` |
-| `transfer_sent` | Sender | `type`, `to`, `amount`, `balance`, `nonce`, `invoice_id` (optional) |
-| `transfer_received` | Recipient | `type`, `from`, `amount`, `balance`, `nonce`, `invoice_id` (optional) |
-| `withdrawal` | Withdrawer | `type`, `to`, `amount`, `balance`, `nonce` |
+All four per-user events leave `PlainEvent.EventSubType` as the zero `[32]byte`. The `Type` string inside the (encrypted) `Data` is what distinguishes them at decryption time. On-chain, the indexed `eventSubType` topic is filled in by the Executor: if the recipient registered a subtype seed at `ASSOCIATEKEY` time, the Executor derives an HMAC-based opaque value from that seed so external observers can't correlate events across users; if no seed is registered, whatever the app wrote (zero, in this app) is emitted as-is.
+
+| `Type` (inside Data) | Recipient | Data Fields |
+|---|---|---|
+| `deposit` | Depositor | `type`, `tokenAddress`, `amount`, `balance`, `nonce` |
+| `transfer_sent` | Sender | `type`, `to`, `tokenAddress`, `amount`, `balance`, `nonce`, `invoice_id` (optional) |
+| `transfer_received` | Recipient | `type`, `from`, `tokenAddress`, `amount`, `balance`, `nonce`, `invoice_id` (optional) |
+| `withdrawal` | Withdrawer | `type`, `to`, `tokenAddress`, `amount`, `balance`, `nonce` |
+
+In addition, a transfer that carries an `InvoiceID` emits one plaintext `AppEvent` with `Data = nil` and `EventSubType = keccak256(lenPrefix || InvoiceID || sender || tokenAddress || amount || recipient)` — a third party who knows the transfer parameters can recompute the hash and find the event on-chain as proof of execution.
 
 ### Emitting an Event
 
 ```go
 eventData, _ := json.Marshal(DepositEvent{
-    Type:    "deposit",
-    Amount:  value,
-    Balance: currentState.Accounts[senderHex].Balance,
-    Nonce:   currentState.Nonce,
+    Type:         "deposit",
+    TokenAddress: *tokenPtr,
+    Amount:       value,
+    Balance:      balance,
+    Nonce:        currentState.Nonce,
 })
 
-events = append(events, PlainEvent{
-    UserID:       *senderPtr,     // who receives this event
-    EventSubType: "deposit",      // plaintext filter (visible on-chain)
-    Data:         eventData,      // encrypted by the Executor
+// Per-user encrypted event. EventSubType is intentionally unset — see above.
+events = append(events, types.PlainEvent{
+    UserID: *senderPtr, // who receives this event
+    Data:   eventData,  // encrypted by the Executor with the recipient's P-521 key
 })
 ```
 
-`EventSubType` is emitted in plaintext on-chain (for filtering/indexing). `Data` is encrypted — only the target user can read it. Design your sub-types to not leak sensitive information.
+`EventSubType` is a `bytes32` value emitted as an **indexed** on-chain log topic (for filtering/indexing). For `PlainEvent`s targeted at seed-registered users, the Executor overrides whatever the app writes with an HMAC-derived subtype drawn from the user's seed (see `SUBTYPE_KEY_MESSAGE` and `generateSubtypeSet` in the TypeScript client guide). `Data` is encrypted — only the target user can read it.
 
-If you need to emit a public, application-wide signal (not targeted at any single user), append to the `AppEvents` slice on `DepositResult` / `ProcessResult` instead. `AppEvent.Data` is **not** encrypted and is emitted on-chain as `AppEvent(applicationId, requestId, eventSubType, data)`.
+If you need to emit a public, application-wide signal (not targeted at any single user), append to the `AppEvents` slice on `DepositResult` / `ProcessResult` instead. `AppEvent.Data` is **not** encrypted and is emitted on-chain as `AppEvent(applicationId, requestId, eventSubType, data)` — with `eventSubType` as an indexed `bytes32` topic that the Executor does **not** override (the app-supplied value is used verbatim).
 
 ---
 
@@ -573,8 +774,7 @@ Since your code compiles with TinyGo (not standard Go), keep these limitations i
 
 To test this app with the local dev environment:
 
-1. Download `payment_app.wasm` from https://github.com/HorizenOfficial/vela-nova/releases/tag/v0.0.25
-2. Copy it into `dockerfiles/wasms/` and rename to `1.wasm`
+1. Download `payment_app.wasm` from https://github.com/HorizenOfficial/vela-nova/releases/tag/v0.1.0
 3. Start the environment: `cd dockerfiles && cp .env.dev .env && docker compose up`
 4. Download the `nova-linux` wallet from the same release page
 5. Configure `wallet.conf` (from `wallet.conf.template`):
@@ -590,7 +790,7 @@ To test this app with the local dev environment:
     - `keyP521`: generate with `./nova-linux generatekeys`
 7. Deploy and interact:
     ```bash
-    ./nova-linux deployapp 1
+    ./nova-linux deployapp --wasm /absolute/path/to/payment_app.wasm --max-value-fee "100 wei" (Use an account with `DEPLOYAPP` role)
     ./nova-linux registeruser
     ./nova-linux getpublicbalance
     ./nova-linux deposit -a "1 ETH"
@@ -604,10 +804,10 @@ To test this app with the local dev environment:
 Building an application on Vela CCE comes down to:
 
 1. **Define your state** — a JSON-serializable struct that holds all application data.
-2. **Import shared types** — use `Address`, `Uint256`, `PlainEvent`, `Withdrawal`, and result types from `vela-common-go/wasm/types`.
-3. **Implement three exports** — `load_module` (init), `deposit` (fund accounts), `process_request` (transfers, withdrawals, and deanonymization via `requestType` routing).
+2. **Import shared types** — use `Address`, `Uint256`, `PlainEvent`, `AppEvent`, `Withdrawal`, and result types from `vela-common-go/wasm/types`.
+3. **Implement the exports** — `deploy` (init with constructor params), `load_module` (cache warm-up fallback), `deposit` (fund accounts per token), `process_request` (transfers, withdrawals, and deanonymization via `requestType` routing).
 4. **Memory management** — `allocate`/`deallocate` are provided by `vela-common-go/wasm/utils`.
-5. **Return results** — updated state, events for users, withdrawals for on-chain transfers, fuel for fee calculation, and optional report for deanonymization.
+5. **Return results** — updated state, events for users (subtype as `[32]byte`), withdrawals for on-chain transfers (with per-token `TokenAddress`), fuel for fee calculation, and optional report for deanonymization.
 6. **Handle errors** — return early with an `Error` string; never leave state partially modified.
 7. **Compile with TinyGo** — `tinygo build -target=wasi .`
 
@@ -617,6 +817,6 @@ The Executor handles all cryptography (state encryption, event encryption, paylo
 
 | Resource | URL |
 |----------|-----|
-| Vela Nova (test app source) | https://github.com/HorizenOfficial/vela-nova/releases/tag/v0.0.25 |
+| Vela Nova (test app source) | https://github.com/HorizenOfficial/vela-nova/releases/tag/v0.1.0 |
 | Vela Common TS (browser client) | https://github.com/HorizenOfficial/vela-common-ts |
 | Local dev environment | `dockerfiles/` in this repository |

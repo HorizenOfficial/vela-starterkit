@@ -9,7 +9,7 @@ This is the **vela-starterkit** — a developer onboarding kit for Vela CCE (Con
 - A Docker Compose local environment (`dockerfiles/`) that runs the full Vela stack locally
 - No application source code — the actual platform components live in sibling repositories
 
-**Current version: v0.0.25** (all Docker images tagged `v0.0.25`).
+**Current version: v0.1.0** (all Docker images tagged `v0.1.0`).
 
 ## Related Repositories
 
@@ -42,7 +42,7 @@ Volume prefix: `vela-skit-*`. Container prefix: `vela-skit-*`.
 | `docs/2_private-transfer-app.md` | Step-by-step WASM app development guide with Go code from vela-nova |
 | `docs/3_typescript-client.md` | Browser client: VelaClient API, key derivation, encryption, subgraph queries |
 
-## Key Architecture Facts (v0.0.25)
+## Key Architecture Facts (v0.1.0)
 
 - **WASM exports**: `load_module`, `deploy` (called once at app deployment with constructor params), `deposit`, `process_request` (with `requestType int32` param). The old `generate_deanonymization_report` export was removed — deanonymization is now a case inside `process_request` routed via `requestType`.
 - **ProcessResult** has an optional `Report []byte` field for deanonymization data.
