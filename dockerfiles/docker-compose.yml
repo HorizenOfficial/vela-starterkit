@@ -14,10 +14,14 @@ volumes:
   vela-skit-deploy-data:
   vela-skit-subgraph-postgres:
   vela-skit-subgraph-ipfs:
+  # Shared between manager (writer) and authorityservice (reader). The image only
+  # declares an anonymous VOLUME for /shared-data, which docker assigns per-container,
+  # so the two services would otherwise NOT see the same directory. Pin a named volume.
+  vela-skit-shared-data:
 
 services:
   executor:
-    image: horizen/cce-executor:v0.1.0
+    image: horizen/cce-executor:${VELA_IMAGE_TAG:-v0.1.0}
     container_name: vela-skit-executor
     restart: always
     privileged: true
@@ -49,7 +53,7 @@ services:
     depends_on:
       - chain
   manager:
-    image: horizen/cce-manager:v0.1.0
+    image: horizen/cce-manager:${VELA_IMAGE_TAG:-v0.1.0}
     container_name: vela-skit-manager
     restart: always
     privileged: true
@@ -105,13 +109,14 @@ services:
       - vela-skit-manager-reports:${MANAGER_REPORTS_FOLDER:-/reports}
       - vela-skit-logs:${LOG_SERVER_FOLDER:-/logs}
       - vela-skit-deploy-data:/deploy-data:ro
+      - vela-skit-shared-data:/shared-data
     depends_on:
       executor:
         condition: service_started
       deployer:
         condition: service_completed_successfully
   authorityservice:
-    image: horizen/cce-authorityservice:v0.1.0
+    image: horizen/cce-authorityservice:${VELA_IMAGE_TAG:-v0.1.0}
     container_name: vela-skit-authorityservice
     restart: always
     ports:
@@ -138,6 +143,7 @@ services:
     volumes:
       - vela-skit-manager-reports:${MANAGER_REPORTS_FOLDER:-/reports}
       - vela-skit-deploy-data:/deploy-data:ro
+      - vela-skit-shared-data:/shared-data
     depends_on:
       manager:
         condition: service_started
@@ -146,7 +152,7 @@ services:
       subgraph-deployer:
         condition: service_completed_successfully
   chain:
-    image: horizen/cce-chain:v0.1.0
+    image: horizen/cce-chain:${VELA_IMAGE_TAG:-v0.1.0}
     container_name: vela-skit-chain
     restart: always
     environment:
@@ -161,7 +167,7 @@ services:
     volumes:
       - vela-skit-chain-data:${CHAIN_DATA_FOLDER:-/data}
   deployer:
-    image: horizen/cce-deployer:v0.1.0
+    image: horizen/cce-deployer:${VELA_IMAGE_TAG:-v0.1.0}
     container_name: vela-skit-deployer
     restart: "no"
     environment:
@@ -262,7 +268,7 @@ services:
       retries: 30
       start_period: 20s
   subgraph-deployer:
-    image: horizen/cce-subgraph-deployer:v0.1.0
+    image: horizen/cce-subgraph-deployer:${VELA_IMAGE_TAG:-v0.1.0}
     container_name: vela-skit-subgraph-deployer
     restart: "no"
     environment:
