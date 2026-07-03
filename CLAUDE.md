@@ -9,7 +9,7 @@ This is the **vela-starterkit** — a developer onboarding kit for Vela CCE (Con
 - A Docker Compose local environment (`dockerfiles/`) that runs the full Vela stack locally
 - No application source code — the actual platform components live in sibling repositories
 
-**Current version: v0.1.0** (all Docker images tagged `v0.1.0`).
+**Current version: v0.2.0** (all Docker images tagged `v0.2.0`).
 
 ## Related Repositories
 
@@ -41,10 +41,14 @@ Volume prefix: `vela-skit-*`. Container prefix: `vela-skit-*`.
 | `docs/1_summary.md` | Full architecture: smart contracts, Manager, Executor, WASM interface, crypto, deployment, config reference |
 | `docs/2_private-transfer-app.md` | Step-by-step WASM app development guide with Go code from vela-nova |
 | `docs/3_typescript-client.md` | Browser client: VelaClient API, key derivation, encryption, subgraph queries |
+| `docs/4_trigger-contract-app.md` | Step-by-step guide for a trigger-contract app (`TRUSTPROCESS`/`trusted_request`); Go code translated from `vela` `app/trigger` and the Rust zen-mixer |
 
-## Key Architecture Facts (v0.1.0)
+## Key Architecture Facts (v0.2.0)
 
-- **WASM exports**: `load_module`, `deploy` (called once at app deployment with constructor params), `deposit`, `process_request` (with `requestType int32` param). The old `generate_deanonymization_report` export was removed — deanonymization is now a case inside `process_request` routed via `requestType`.
+- **WASM exports**: `load_module`, `deploy` (called once at app deployment with constructor params), `deposit`, `process_request` (with `requestType int32` param), and `trusted_request` (called for `TRUSTPROCESS` requests). The old `generate_deanonymization_report` export was removed — deanonymization is now a case inside `process_request` routed via `requestType`.
+- **RequestType** has five values: `DEPLOYAPP=0`, `PROCESS=1`, `DEANONYMIZATION=2`, `ASSOCIATEKEY=3`, `TRUSTPROCESS=4`. `submitRequest` rejects `DEPLOYAPP` and `TRUSTPROCESS` with `InvalidRequestType`.
+- **External triggers**: `submitDeployRequestWithTrigger`, the `ITrigger`/`AbstractTrigger` contracts, and `TriggerExecuted`/`TriggerWithdraw` events back the `TRUSTPROCESS` / `trusted_request` flow.
+- **TokenAllowlist** is a standalone contract (constructor-injected into `ProcessorEndpoint`), not internal to the endpoint. The `RESET_OPERATOR` role adds `adminReset()`/`adminResetApps()`, which are testnet/dev only — the role can only be granted at deployment and is permanently disabled in production.
 - **ProcessResult** has an optional `Report []byte` field for deanonymization data.
 - **Common types** (`Address`, `Uint256`, `PlainEvent`, `Withdrawal`, result structs) come from `vela-common-go/wasm/types`, not defined locally per app.
 - **TypeScript client** class is `VelaClient` (renamed from `HorizenCCEClient`). Package is `vela-common-ts` (renamed from `horizen-cce-common-ts`).

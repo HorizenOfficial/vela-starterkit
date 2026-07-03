@@ -1,4 +1,4 @@
-# Vela - Architecture Summary (v0.1.0)
+# Vela - Architecture Summary (v0.2.0)
 
 ## 1. System Overview
 
@@ -14,7 +14,7 @@ Vela  is a platform that executes WebAssembly (WASM) modules inside AWS Nitro En
                                  │    and signature verification)   │
                                  │  AuthorityRegistry (authority    │
                                  │    permissions)                  │
-                                 └────────┬──────────▲─────────────┘
+                                 └────────┬──────────▲──────────────┘
                                           │          │
                               fetch requests    submit state updates
                                           │          │
@@ -23,16 +23,16 @@ Vela  is a platform that executes WebAssembly (WASM) modules inside AWS Nitro En
 │                    (runs outside enclave)                             │
 │                                                                       │
 │  ┌──────────────┐   ┌────────────────┐   ┌────────────────────────┐   │
-│  │  Blockchain   │   │  Executor      │   │  Storage (LevelDB)     │  │
-│  │  Client       │   │  Client        │   │  - versioned app state │  │
-│  │  (RPC)        │   │  (TCP/VSock)   │   │  - WASM bytecode       │  │
-│  └──────────────┘   └───────┬────────┘    │  - keyset recovery     │  │
-│                              │            └────────────────────────┘  │
+│  │  Blockchain  │   │  Executor      │   │  Storage (LevelDB)     │   │
+│  │  Client      │   │  Client        │   │  - versioned app state │   │
+│  │  (RPC)       │   │  (TCP/VSock)   │   │  - WASM bytecode       │   │
+│  └──────────────┘   └───────┬────────┘   │  - keyset recovery     │   │
+│                              │           └────────────────────────┘   │
 │  ┌──────────────────────────────────────────────────────────────────┐ │
-│  │  Log Server (centralized logging with optional file rotation)   │ │
+│  │  Log Server (centralized logging with optional file rotation)    │ │
 │  └──────────────────────────────────────────────────────────────────┘ │
 │  ┌──────────────────────────────────────────────────────────────────┐ │
-│  │  Admin Interface (MANAGER_ADMIN_PORT)                           │ │
+│  │  Admin Interface (MANAGER_ADMIN_PORT)                            │ │
 │  └──────────────────────────────────────────────────────────────────┘ │
 └──────────────────────────────┼────────────────────────────────────────┘
                                │ bidirectional messages
@@ -41,14 +41,14 @@ Vela  is a platform that executes WebAssembly (WASM) modules inside AWS Nitro En
 │                    WASM Executor (AWS Nitro Enclave)                  │
 │                                                                       │
 │  ┌──────────────┐   ┌───────────────────┐   ┌─────────────────────┐   │
-│  │  Enclave      │   │  Wasmtime Runtime │   │  Crypto Operations  │  │
-│  │  KeySet       │   │  (WASM execution) │   │  - AES-256 state    │  │
-│  │  - AES state  │   │                   │   │  - P521 ECDH events │  │
-│  │  - secp256k1  │   │  ┌─────────────┐  │   │  - secp256k1 sign   │  │
-│  │    signing    │   │  │ WASM Guest  │  │   └─────────────────────┘  │
-│  │  - P521 comm  │   │  │ Application │  │                            │
+│  │  Enclave     │   │  Wasmtime Runtime │   │  Crypto Operations  │   │
+│  │  KeySet      │   │  (WASM execution) │   │  - AES-256 state    │   │
+│  │  - AES state │   │                   │   │  - P521 ECDH events │   │
+│  │  - secp256k1 │   │  ┌─────────────┐  │   │  - secp256k1 sign   │   │
+│  │    signing   │   │  │ WASM Guest  │  │   └─────────────────────┘   │
+│  │  - P521 comm │   │  │ Application │  │                             │
 │  └──────────────┘   │  └─────────────┘  │                             │
-│                      └───────────────────┘                            │
+│                     └───────────────────┘                             │
 └───────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -58,19 +58,20 @@ Vela  is a platform that executes WebAssembly (WASM) modules inside AWS Nitro En
 
 ### 2.1 Smart Contracts (Blockchain Layer)
 
-The on-chain layer coordinates request submission, TEE attestation, and state management.
+The on-chain layer coordinates request submission, TEE attestation and state management.
 
 #### ProcessorEndpoint
 
 The primary contract. Manages a FIFO request queue and processes state updates.
 
-- **Request submission** (`submitRequest`): Users enqueue `PROCESS`, `DEANONYMIZATION` or `ASSOCIATEKEY` requests. Each request carries an application ID, request type, encrypted payload, a token address (`0x0` = native ETH), an asset amount, and a max fee. `DEPLOYAPP` is rejected here — deployments use a separate entry point.
+- **Request submission** (`submitRequest`): Users enqueue `PROCESS`, `DEANONYMIZATION` or `ASSOCIATEKEY` requests. Each request carries an application ID, request type, encrypted payload, a token address (`0x0` = native ETH), an asset amount, and a max fee. `DEPLOYAPP` and `TRUSTPROCESS` are rejected here (`InvalidRequestType`) — deployments use a separate entry point, and trigger-driven `TRUSTPROCESS` requests are submitted by trigger contracts.
 - **Meta-transaction submission** (`submitRequestFor`): A facilitator submits a `PROCESS` or `ASSOCIATEKEY` request on behalf of an end user. The user signs an EIP-712 authorization (`REQUEST_AUTHORIZATION_TYPEHASH`) covering `sender`, protocol version, application ID, request type, payload hash, token address, asset amount, nonce, and deadline; the facilitator pays gas and the fee via `msg.value`. Per-user nonces (`facilitatorNonces[sender]`) provide replay protection and are readable via `getFacilitatorNonce(user)`. ERC-20 asset transfer uses EIP-2612 `permit` + `transferFrom` — the `depositPermit` field decodes to `(uint8 v, bytes32 r, bytes32 s)`. The resulting `PendingRequest.sender` is the end user; `PendingRequest.facilitator` is the caller.
-- **Deploy submission** (`submitDeployRequest`): Restricted to addresses with `DEPLOYER_ROLE`. Takes a protocol version and a deploy descriptor payload referencing the WASM artifact by its `sha256`. A unique `applicationId` is derived from the request ID for each deploy.
-- **State update** (`stateUpdate`): Called by the Manager after execution. Verifies the TEE signature, updates the on-chain state root, emits encrypted events, processes withdrawals and refunds via pull-payment claims. The TEE also reports success/failure inline via `errorCode` + `errorMsg`.
+- **Deploy submission** (`submitDeployRequest`): Restricted to addresses with `DEPLOYER_ROLE`. Takes a protocol version and a deploy descriptor payload referencing the WASM artifact by its `sha256`. A unique `applicationId` is derived from the request ID for each deploy. A `submitDeployRequestWithTrigger` variant additionally wires the app to an external trigger contract that can enqueue `TRUSTPROCESS` requests.
+- **State update** (`stateUpdate`): Called by the Manager after execution. Verifies the TEE signature, updates the on-chain state root, emits encrypted events, processes withdrawals and refunds via pull-payment claims and sends calls to the app's trigger contract, if present. The TEE also reports success/failure inline via `errorCode` + `errorMsg`.
 - **Claims** (`claim`, `pendingClaims`): Withdrawal and refund amounts are credited to per-token pull-payment balances; recipients call `claim(tokenAddress, payee)` to collect.
-- **ERC-20 support**: For non-ETH tokens the caller must `approve` the `ProcessorEndpoint` up to `assetAmount` before calling `submitRequest`; tokens are pulled via `safeTransferFrom`. Only tokens in the `TokenAllowlist` are accepted.
-- **Access control**: `UPDATE_STATUS_ROLE` for state updates; `DEPLOYER_ROLE` for deploy submissions; `ADMIN` for configuration.
+- **ERC-20 support**: For non-ETH tokens the caller must `approve` the `ProcessorEndpoint` up to `assetAmount` before calling `submitRequest`; tokens are pulled via `safeTransferFrom`. Only tokens in the `TokenAllowlist` are accepted — as of v0.2.0 this is a standalone contract injected into `ProcessorEndpoint` via the constructor (exposed as `tokenAllowlist()`), rather than internal endpoint state.
+- **Access control**: `UPDATE_STATUS_ROLE` for state updates; `DEPLOYER_ROLE` for deploy submissions; `ADMIN` for configuration; `RESET_OPERATOR` for the admin reset functions.
+- **Admin reset** (`adminReset`, `adminResetApps`): Queue/app reset restricted to `RESET_OPERATOR`. Testnet/dev only — the role can only be granted at deployment and is permanently disabled in production (the constructor is passed `resetOperator = address(0)`).
 
 Key data structures:
 ```solidity
@@ -85,7 +86,7 @@ struct PendingRequest {
     address facilitator;      // address(0) for direct submissions, facilitator address for meta-tx
     uint64  applicationId;
     uint8   protocolVersion;
-    RequestType requestType;  // DEPLOYAPP | PROCESS | DEANONYMIZATION | ASSOCIATEKEY
+    RequestType requestType;  // DEPLOYAPP | PROCESS | DEANONYMIZATION | ASSOCIATEKEY | TRUSTPROCESS
 }
 
 struct WithdrawalRequest {
@@ -95,7 +96,7 @@ struct WithdrawalRequest {
 }
 ```
 
-Events: `RequestSubmitted` (carries `facilitator`), `RequestCompleted`, `DeployRequestSubmitted`, `DeployRequestCompleted`, `StateRootUpdate`, `UserEvent` (encrypted, per-user), `AppEvent` (plaintext, application-level), `Refund` (with `tokenAddress`), `Withdrawal` (with `tokenAddress`), `ReportGenerated`, `PaymentWithdrawn`.
+Events: `RequestSubmitted` (carries `facilitator`), `RequestCompleted`, `DeployRequestSubmitted`, `DeployRequestCompleted`, `StateRootUpdate`, `UserEvent` (encrypted, per-user), `AppEvent` (plaintext, application-level), `Refund` (with `tokenAddress`), `Withdrawal` (with `tokenAddress`), `ReportGenerated`, `PaymentWithdrawn`, `TriggerExecuted`, `TriggerWithdraw`.
 
 #### TeeAuthenticator
 
@@ -151,7 +152,7 @@ every N seconds:
 - Retains last N versions for rollback on chain reorganization
 - Non-versioned storage for enclave keyset recovery data
 
-**Log server** (new in v0.0.25):
+**Log server**:
 - Centralized log collection from both Manager and Executor
 - Optional file rotation with configurable parameters:
   - `LOG_SERVER_FILE_ROTATION` — enable/disable rotation
@@ -160,7 +161,7 @@ every N seconds:
   - `LOG_SERVER_FILE_MAX_AGE_DAYS` — max age before deletion
   - `LOG_SERVER_FILE_COMPRESS` — compress rotated files
 
-**Admin interface** (new in v0.0.25):
+**Admin interface**:
 - Exposed on `MANAGER_ADMIN_PORT`
 - Configurable request timeout via `MANAGER_ADMIN_COMMUNICATION_PARAMS_REQUEST_TIMEOUT_SEC`
 
@@ -218,6 +219,8 @@ A deploy has two phases: off-chain WASM artifact upload, then on-chain `submitDe
 2. The deployer calls `submitDeployRequest(protocolVersion, payload)` on `ProcessorEndpoint`, where `payload` is a JSON deploy descriptor: `{ "mode": "artifact_ref", "artifactId": "sha256:<hex>", "wasmSha256": "<hex>", "constructorParams": … }`.
 3. The contract derives a fresh `applicationId` from the request hash and enqueues the deploy.
 
+To wire the app to an external trigger contract (for the `TRUSTPROCESS` / `trusted_request` flow), the trigger contract must be deployed **before** the deploy request, and the deployer calls `submitDeployRequestWithTrigger(protocolVersion, payload, trigger)` instead of `submitDeployRequest`, passing the already-deployed trigger contract address.
+
 ```
 Deployer                 Blockchain              Manager                Executor
   │                          │                      │                      │
@@ -272,16 +275,68 @@ User                     Blockchain              Manager                Executor
   │                          │                      │── store new state    │
   │                          │<── stateUpdate ──────│   in LevelDB         │
   │                          │── emit UserEvent(s)  │                      │
+  │                          │── emit AppEvent(s)   │                      │
   │                          │── process withdrawals│                      │
   │<── RequestCompleted ─────│                      │                      │
   │<── UserEvent(encrypted) ─│                      │                      │
+  │<── AppEvent(plaintext) ──│                      │                      │
 ```
 
-### 3.3 Associate Key
+### 3.3 Process Request with Trigger Contract
+
+When an app is deployed with a trigger contract (via `submitDeployRequestWithTrigger`, see [3.1](#31-deploy-application)), a normal request can spawn a follow-up `TRUSTPROCESS` request that runs the app's `trusted_request` export. Nothing external fires the trigger directly — it is invoked **on-chain as a side effect of finalizing any normal request** (`PROCESS`, `ASSOCIATEKEY`, `DEANONYMIZATION`, or a prior `TRUSTPROCESS`) for that app.
+
+The trigger callbacks all run inside `stateUpdate`, in strict order, each in an isolated `try/catch` so a reverting trigger can never block the state update:
+
+1. **Claim** — withdrawals directed to the trigger address are pushed into the trigger contract (funds "unshielded" to the trigger).
+2. **`execute(appEventData)`** — the app-level plaintext events (`AppEvent`s) from the WASM run are handed to the trigger; emits `TriggerExecuted`.
+3. **`withdraw()`** — a non-overridable sweep returns all ERC-20 + ETH balances from the trigger back to the endpoint's custody (funds "re-shielded").
+4. **`getTrustProcessPayload(...)`** — the trigger returns a `bytes` payload. A **non-empty** return enqueues a new `TRUSTPROCESS` request; empty means none. Emits `TriggerWithdraw`.
+
+The `TRUSTPROCESS` request goes into a **separate, higher-priority trigger queue**: `getNextPendingRequest` drains trigger requests before normal ones. The Executor treats it specially — the payload is clear text (**not** ECDH-decrypted), the min-fee check is skipped, and the application fee is `0` (authenticity is established on-chain, not by an end-user signature). It is routed to the WASM `trusted_request` export, which receives **no sender and no `requestType`**. Its `stateUpdate` can invoke the trigger again, so the round-trip can chain.
+
+```
+Trigger contract          Blockchain              Manager                Executor
+  │                          │                      │                      │
+  │  (a normal request for the app is processed and reaches stateUpdate)   │
+  │                          │<── stateUpdate ──────│                      │
+  │                          │── credit withdrawals │                      │
+  │<── claim (unshield) ─────│                      │                      │
+  │<── execute(appEventData) │                      │                      │
+  │── TriggerExecuted ──────>│                      │                      │
+  │<── withdraw() (reshield) │                      │                      │
+  │── returned/failed ──────>│                      │                      │
+  │<── getTrustProcessPayload│                      │                      │
+  │── trustedPayload ───────>│                      │                      │
+  │                          │── TriggerWithdraw    │                      │
+  │                          │  if payload != empty:│                      │
+  │                          │── enqueue TRUSTPROCESS│  (trigger queue)    │
+  │                          │   (RequestSubmitted)  │                      │
+  │                          │                      │                      │
+  │                          │<── poll (trigger ────│                      │
+  │                          │     queue first)     │                      │
+  │                          │── PendingRequest ───>│                      │
+  │                          │  (TRUSTPROCESS)      │── load state+WASM    │
+  │                          │                      │── SendProcessReq ───>│
+  │                          │                      │                      │─ decrypt state (AES)
+  │                          │                      │                      │─ payload passed as-is
+  │                          │                      │                      │   (no ECDH decrypt)
+  │                          │                      │                      │─ call WASM trusted_request()
+  │                          │                      │                      │   (no sender, no requestType)
+  │                          │                      │                      │─ encrypt new state / events
+  │                          │                      │                      │─ sign payload (fee = 0)
+  │                          │                      │<─ UpdatePayload ─────│
+  │                          │                      │<─ ApplicationState ──│
+  │                          │<── stateUpdate ──────│                      │
+  │                          │  (may invoke trigger again → can chain)     │
+  │                          │── RequestCompleted    │                      │
+```
+
+### 3.4 Associate Key
 
 Before a user can receive encrypted events or submit encrypted payloads, they register their P-521 public key on-chain via an `ASSOCIATEKEY` request. The payload is either the raw 133-byte uncompressed public key, or 226 bytes = public key || encrypted subtype seed (when the user opts in to privacy-preserving event sub-types derived from an HMAC'd seed). The Executor stores the key (and, if provided, the seed) in the user key store (part of AppData). Subsequent event encryption uses this key via ECDH.
 
-### 3.4 Deanonymization
+### 3.5 Deanonymization
 
 An authorized authority submits a `DEANONYMIZATION` request. The Executor passes the request to `process_request()` with `requestType = Deanonymize`. The WASM application uses the `requestType` parameter to determine that a deanonymization report is needed and returns the report data in the `ProcessResult.Report` field. The Executor validates that report data is present, encrypts it with the authority's P-521 public key, and stores it. The Manager stores the encrypted report on the filesystem. The authority retrieves it via the Authority Service HTTP API (`GET /nonce` + `POST /getreport`).
 
@@ -401,6 +456,23 @@ type ProcessResult struct {
 
 When `requestType` is `DEANONYMIZATION` (value 2), the application **must** populate the `Report` field. The Executor validates this: if the request is a deanonymization but `Report` is empty, or if `Report` is non-empty for a non-deanonymization request, the Executor returns an error.
 
+#### `trusted_request(appId: i64, payloadPtr: *byte, payloadLen: i32, statePtr: *byte, stateLen: i32) -> *byte` (optional)
+
+Called for `TRUSTPROCESS` requests, which are enqueued by an external trigger contract (see `submitDeployRequestWithTrigger`) rather than an end user. Unlike `process_request`, it receives **no sender and no `requestType`** — the trusted path never reads a sender, and the request type is implicit. It returns a `ProcessResult`, exactly like `process_request`.
+
+```go
+//export trusted_request
+func trusted_request(appId int64, payloadPtr *byte, payloadLen int32,
+                     statePtr *byte, stateLen int32) *byte {
+    payload := utils.PtrToString(payloadPtr, payloadLen)
+    state   := utils.PtrToString(statePtr, stateLen)
+    result  := myapp.TrustedRequest(payload, state)
+    return types.SerializeAndWriteResult(result)
+}
+```
+
+Only apps that opt into the trigger flow need to export this. If a `TRUSTPROCESS` request reaches an app that does not export `trusted_request`, the Executor fails the request with `trusted_request function not found`. The reference `vela-nova` app does not implement it.
+
 #### `allocate` and `deallocate`
 
 Memory management functions. These must be implemented in the WASM module's `utils` package. They manage memory allocation and deallocation for data exchange between host and guest.
@@ -457,14 +529,15 @@ The Executor routes requests by type to the appropriate WASM export:
 
 | Value | Type | Submitted via | WASM Export Called |
 |-------|------|--------------|-------------------|
-| 0 | `DEPLOYAPP` | `submitDeployRequest` (DEPLOYER_ROLE only) | `load_module` |
+| 0 | `DEPLOYAPP` | `submitDeployRequest` / `submitDeployRequestWithTrigger` (DEPLOYER_ROLE only) | `load_module` |
 | 1 | `PROCESS` | `submitRequest` | `deposit` (if `assetAmount > 0`) + `process_request(requestType=1)` |
 | 2 | `DEANONYMIZATION` | `submitRequest` (AuthorityRegistry-gated) | `process_request(requestType=2)` — app returns report in `ProcessResult.Report` |
 | 3 | `ASSOCIATEKEY` | `submitRequest` | None (handled entirely by the Executor) |
+| 4 | `TRUSTPROCESS` | External trigger contract (not `submitRequest`) | `trusted_request` (no sender, no requestType) |
 
 The `requestType` is passed to `process_request` as an `int32` parameter. The WASM application uses it to determine which logic to execute (e.g., standard processing vs. deanonymization report generation). This is a change from earlier versions where deanonymization had a separate WASM export.
 
-`submitRequest` rejects `DEPLOYAPP` with `InvalidRequestType` — deploys must go through `submitDeployRequest`, which derives a fresh `applicationId` from the request hash.
+`submitRequest` rejects `DEPLOYAPP` and `TRUSTPROCESS` with `InvalidRequestType` — deploys must go through `submitDeployRequest` (which derives a fresh `applicationId` from the request hash), and `TRUSTPROCESS` requests are enqueued by trigger contracts.
 
 ### 4.4 State Management
 
@@ -481,13 +554,14 @@ An application can emit two kinds of events from `deposit` / `process_request`:
 **`PlainEvent` (per-user, encrypted):**
 - Targets a specific user (`UserID`).
 - The Executor encrypts `Data` using the target user's registered P-521 public key (ECDH → AES-GCM).
-- Emitted on-chain as `UserEvent(appId, requestId, eventSubType, encryptedData)`.
+- Emitted on-chain as `UserEvent(applicationId, requestId, eventSubType, encryptedData)`.
 - Users decrypt off-chain using their P-521 private key.
 
 **`AppEvent` (application-level, plaintext):**
 - No recipient — intended for public/app-wide signals (e.g. global state notifications).
 - `Data` is **not** encrypted and is visible on-chain.
-- Emitted as `AppEvent(appId, requestId, eventSubType, data)`.
+- Emitted as `AppEvent(applicationId, requestId, eventSubType, data)`.
+- For apps with a trigger contract, `AppEvent`s are also how the WASM app passes parameters to the trigger: during `stateUpdate` the endpoint hands the app-level events to the trigger's `execute(appEventData)` and `getTrustProcessPayload(...)` callbacks (see [3.3](#33-process-request-with-trigger-contract)), which the trigger decodes to decide what follow-up `TRUSTPROCESS` payload to return.
 
 `EventSubType` is a `bytes32` value emitted as an **indexed** log topic (usable as an indexer/subgraph filter). For `PlainEvent`s, the value the app writes depends on whether the target user registered a subtype seed at `ASSOCIATEKEY` time: if a seed is present, the Executor **overrides** any app-supplied subtype with an HMAC-derived opaque value drawn from the user's seed (privacy-preserving, unlinkable across users), so apps typically leave `EventSubType` as the zero `[32]byte`; if no seed is registered, the app-supplied value is preserved and can be a short ASCII label packed into the first bytes (`[32]byte{'d','e','p','o','s','i','t',0,…}`). For `AppEvent`s the app's value is always used as-is. Design any app-supplied sub-types so they don't leak sensitive information.
 
@@ -551,18 +625,18 @@ On Executor restart, the keyset recovery mechanism (controlled by `EXECUTOR_KEYS
 
 ## 7. Deployment Architecture (Docker Compose)
 
-The local development environment runs the full stack via Docker Compose. All images use the `v0.1.0` tag.
+The local development environment runs the full stack via Docker Compose. All images use the `v0.2.0` tag (overridable via the `VELA_IMAGE_TAG` env var).
 
 ### 7.1 Services
 
 | Service | Image | Purpose |
 |---------|-------|---------|
-| `executor` | `horizen/cce-executor:v0.1.0` | WASM execution inside emulated TEE |
-| `manager` | `horizen/cce-manager:v0.1.0` | Orchestration, blockchain polling, state storage |
-| `authorityservice` | `horizen/cce-authorityservice:v0.1.0` | Deanonymization report retrieval API |
-| `chain` | `horizen/cce-chain:v0.1.0` | Anvil dev chain (Foundry) |
-| `deployer` | `horizen/cce-deployer:v0.1.0` | Smart contract deployment (runs once) |
-| `subgraph-deployer` | `horizen/cce-subgraph-deployer:v0.1.0` | Subgraph deployment (runs once) |
+| `executor` | `horizen/cce-executor:v0.2.0` | WASM execution inside emulated TEE |
+| `manager` | `horizen/cce-manager:v0.2.0` | Orchestration, blockchain polling, state storage |
+| `authorityservice` | `horizen/cce-authorityservice:v0.2.0` | Deanonymization report retrieval API |
+| `chain` | `horizen/cce-chain:v0.2.0` | Anvil dev chain (Foundry) |
+| `deployer` | `horizen/cce-deployer:v0.2.0` | Smart contract deployment (runs once) |
+| `subgraph-deployer` | `horizen/cce-subgraph-deployer:v0.2.0` | Subgraph deployment (runs once) |
 | `subgraph-node` | `graphprotocol/graph-node` | The Graph indexing |
 | `subgraph-postgres` | `postgres:14` | Graph Node database |
 | `subgraph-ipfs` | `ipfs/kubo:v0.17.0` | IPFS for subgraph storage |
@@ -578,7 +652,7 @@ Services communicate over an internal Docker network (`pes_network`) with fixed 
 | Chain | `CHAIN_RPC_ADDRESS` (default: `10.10.40.30`) |
 | Authority Service | `AUTHORITY_SERVICE_IP_ADDRESS` (default: `10.10.40.40`) |
 
-Only the chain RPC (port 8545), authority service (port 8081), and subgraph query endpoint (port 8000) are exposed to the host.
+Only the chain RPC (port 8545), authority service (port 8081), and subgraph query endpoint (port 8000) are exposed to the host. The `manager`, `authorityservice`, `chain`, and `subgraph-node` services additionally attach to a second, non-internal `inet` network for outbound access.
 
 ### 7.3 Volumes
 
@@ -586,6 +660,7 @@ Only the chain RPC (port 8545), authority service (port 8081), and subgraph quer
 |--------|---------|
 | `vela-skit-manager-data` | Manager LevelDB (versioned state) |
 | `vela-skit-manager-reports` | Deanonymization reports (shared with authority service) |
+| `vela-skit-shared-data` | Shared `/shared-data` directory written by the manager and read by the authority service (a named volume is pinned because the image otherwise declares an anonymous per-container volume) |
 | `vela-skit-chain-data` | Anvil blockchain data |
 | `vela-skit-logs` | Centralized log files |
 | `vela-skit-deploy-data` | Deployed contract addresses (shared across services) |
