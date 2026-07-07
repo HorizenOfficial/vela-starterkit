@@ -41,7 +41,7 @@ Volume prefix: `vela-skit-*`. Container prefix: `vela-skit-*`.
 | `docs/1_summary.md` | Full architecture: smart contracts, Manager, Executor, WASM interface, crypto, deployment, config reference |
 | `docs/2_private-transfer-app.md` | Step-by-step WASM app development guide with Go code from vela-nova |
 | `docs/3_typescript-client.md` | Browser client: VelaClient API, key derivation, encryption, subgraph queries |
-| `docs/4_trigger-contract-app.md` | Step-by-step guide for a trigger-contract app (`TRUSTPROCESS`/`trusted_request`); Go code translated from `vela` `app/trigger` and the Rust zen-mixer |
+| `docs/4_trigger-contract-app.md` | Step-by-step guide for a trigger-contract app (`TRUSTPROCESS`/`trusted_request`); |
 
 ## Key Architecture Facts (v0.2.0)
 

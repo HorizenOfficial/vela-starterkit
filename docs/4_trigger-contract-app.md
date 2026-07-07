@@ -804,12 +804,3 @@ Building a trigger-contract app on Vela adds four things on top of a normal app:
 
 Register the trigger both on-chain (`submitDeployRequestWithTrigger`) and in the WASM (`constructorParams.triggerContract`). Keep `trusted_request` idempotent and AppEvent-free, and the round-trip is safe and finite.
 
-### Related Resources
-
-| Resource | URL / Path |
-|----------|-----|
-| Architecture summary — trigger flow | `docs/1_summary.md` §3.3 |
-| Private transfer app (base app guide) | `docs/2_private-transfer-app.md` |
-| Core platform (Go `app/trigger` reference, `AbstractTrigger`) | https://github.com/HorizenOfficial/vela |
-| Vela Common Go (shared WASM types) | https://github.com/HorizenOfficial/vela-common-go |
-| Local dev environment | `dockerfiles/` in this repository |

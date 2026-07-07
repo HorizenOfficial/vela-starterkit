@@ -30,7 +30,7 @@ Record the four refs — you will quote them in the findings report.
 ### 2. Flag version mismatches
 
 Extract version strings from the docs:
-- `CLAUDE.md` declares `**Current version: v0.0.25**` and states all Docker images are tagged `v0.0.25`.
+- `CLAUDE.md` declares `**Current version: v0.2.0**` and states all Docker images are tagged `v0.2.0`.
 - `README.md`, `dockerfiles/.env.dev`, and the docs pages may also pin a version.
 
 Compare those declarations to the refs recorded in step 1. If any sibling repo is checked out at a different tag/branch than the docs claim, list it as a finding. Do not silently "fix" the version string — the mismatch itself is information the user needs.

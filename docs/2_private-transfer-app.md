@@ -60,7 +60,7 @@ require (
 )
 ```
 
-In v0.0.25, common WASM types (`Address`, `Uint256`, `PlainEvent`, `Withdrawal`, result structs) and helper functions are provided by the shared library `vela-common-go`. The guest still communicates with the host via JSON serialization, but type definitions are now shared across WASM applications rather than duplicated in each one.
+Common WASM types (`Address`, `Uint256`, `PlainEvent`, `Withdrawal`, result structs) and helper functions are provided by the shared library `vela-common-go`. The guest still communicates with the host via JSON serialization, but type definitions are now shared across WASM applications rather than duplicated in each one.
 
 | Package | Provides |
 |---------|----------|
@@ -141,10 +141,6 @@ Design choices:
 ## Step 3: Implement the WASM Exports
 
 Your module must export these functions: `deploy`, `load_module`, `deposit`, `process_request`, plus `allocate`/`deallocate` (provided by `vela-common-go/wasm/utils`).
-
-> **Change from v0.0.18**: The `generate_deanonymization_report` export has been removed. Deanonymization is now handled inside `process_request` via the `requestType` parameter.
->
-> **Change from v0.0.25**: A new `deploy` export receives JSON-encoded constructor parameters (the `constructorParams` field of the deploy descriptor). `load_module` is retained for cache warm-up on Executor restart — new deployments go through `deploy`.
 
 ### main.go — The Bridge Layer
 

@@ -493,7 +493,7 @@ Returns memory allocation statistics. Useful for debugging.
 
 ### 4.2 Types
 
-In v0.0.25, common WASM types are provided by the shared library `github.com/HorizenOfficial/vela-common-go/wasm/types`. This library defines the core types (`Address`, `Uint256`, `PlainEvent`, `AppEvent`, `Withdrawal`, result structs) and helper functions (`SerializeAndWriteResult`, `PtrToAddress`, `PtrToUint256`). The utility functions (`PtrToString`, `BytesToPtr`, `allocate`/`deallocate`, `get_allocated_memory_stats`, logging) are in `vela-common-go/wasm/utils`.
+Common WASM types are provided by the shared library `github.com/HorizenOfficial/vela-common-go/wasm/types`. This library defines the core types (`Address`, `Uint256`, `PlainEvent`, `AppEvent`, `Withdrawal`, result structs) and helper functions (`SerializeAndWriteResult`, `PtrToAddress`, `PtrToUint256`). The utility functions (`PtrToString`, `BytesToPtr`, `allocate`/`deallocate`, `get_allocated_memory_stats`, logging) are in `vela-common-go/wasm/utils`.
 
 The WASM guest module still communicates with the host via JSON serialization — both sides define compatible types independently. The guest cannot import host packages (e.g., `go-ethereum`), but it now shares type definitions with other WASM applications through the common library.
 
