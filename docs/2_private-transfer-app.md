@@ -1,4 +1,4 @@
-# Building a Private Transfer App on Vela (v0.1.0)
+# Building a Private Transfer App on Vela (v0.2.0)
 
 This document walks through the implementation of a real WASM application for the Vela CCE platform: a **private transfer app** that supports deposits, account-to-account transfers, withdrawals to external addresses, and regulatory deanonymization. It serves as a practical reference for developers building their own applications.
 It shows some code snippets in GO language.
@@ -8,7 +8,7 @@ It shows some code snippets in GO language.
 App code is available in the following repository:
 
 https://github.com/HorizenOfficial/vela-nova <br>
-*(this guide is based on v0.1.0 tag)*
+*(this guide is based on v0.2.0 tag)*
 
 
 
@@ -39,6 +39,8 @@ runtime/wasm-go/
   go.mod               # Dependencies (vela, vela-common-go)
   integration_test.go  # Tests against the WASM runtime
   system_tests/        # Full end-to-end tests (deploy, encrypt, blockchain)
+  fullstack_tests/     # Full-stack tests against the running platform
+  testhelpers/         # Shared test utilities
 ```
 
 The key insight: **`main.go` is a thin bridge** that converts raw WASM pointers into Go types and delegates to the `app` package. All business logic lives in `app/`. Core types (`Address`, `Uint256`, `PlainEvent`, result structs), memory management (`allocate`/`deallocate`), and WASM utilities are provided by the shared library `vela-common-go`.
@@ -53,12 +55,12 @@ The app references the main vela repository and the shared WASM types library:
 
 ```
 require (
-    github.com/HorizenOfficial/vela v0.1.0
-    github.com/HorizenOfficial/vela-common-go v0.1.0
+    github.com/HorizenOfficial/vela v0.2.0
+    github.com/HorizenOfficial/vela-common-go v0.2.0
 )
 ```
 
-In v0.0.25, common WASM types (`Address`, `Uint256`, `PlainEvent`, `Withdrawal`, result structs) and helper functions are provided by the shared library `vela-common-go`. The guest still communicates with the host via JSON serialization, but type definitions are now shared across WASM applications rather than duplicated in each one.
+Common WASM types (`Address`, `Uint256`, `PlainEvent`, `Withdrawal`, result structs) and helper functions are provided by the shared library `vela-common-go`. The guest still communicates with the host via JSON serialization, but type definitions are now shared across WASM applications rather than duplicated in each one.
 
 | Package | Provides |
 |---------|----------|
@@ -139,10 +141,6 @@ Design choices:
 ## Step 3: Implement the WASM Exports
 
 Your module must export these functions: `deploy`, `load_module`, `deposit`, `process_request`, plus `allocate`/`deallocate` (provided by `vela-common-go/wasm/utils`).
-
-> **Change from v0.0.18**: The `generate_deanonymization_report` export has been removed. Deanonymization is now handled inside `process_request` via the `requestType` parameter.
->
-> **Change from v0.0.25**: A new `deploy` export receives JSON-encoded constructor parameters (the `constructorParams` field of the deploy descriptor). `load_module` is retained for cache warm-up on Executor restart — new deployments go through `deploy`.
 
 ### main.go — The Bridge Layer
 
@@ -534,9 +532,9 @@ case "withdraw":
 
 When `requestType == common.Deanonymize`, the app generates a report and returns it in `ProcessResult.Report`. The state is **not modified** — the original state JSON is returned as-is to avoid unnecessary marshalling.
 
-The reference app supports two report types, selected by the `reportType` field inside the payload (defaults to `"balances"` when the payload is empty or omits the field):
+The reference app supports two report types, selected by the `report_type` field inside the payload (defaults to `"balances"` when the payload is empty or omits the field):
 
-| `reportType` | Shape | Contents |
+| `report_type` | Shape | Contents |
 |---|---|---|
 | `"balances"` (default) | `DeanonymizationReport{Accounts, Nonce}` | Full snapshot of all accounts' per-token balances and the current state nonce. |
 | `"tx_history"` | `TxHistoryReport{Address, Balances, Transactions}` | The target `Address`'s current per-token balances plus all in-state transaction records involving it, optionally filtered to the `[FromTimestamp, ToTimestamp]` window. |
@@ -645,7 +643,7 @@ Empty payload (defaults to a full `"balances"` snapshot):
 Explicit balances report (same as the default):
 ```json
 {
-  "deanonymize": { "reportType": "balances" }
+  "deanonymize": { "report_type": "balances" }
 }
 ```
 
@@ -653,15 +651,15 @@ Transaction-history report for one address, optionally time-windowed:
 ```json
 {
   "deanonymize": {
-    "reportType": "tx_history",
+    "report_type": "tx_history",
     "address": "0x1234567890abcdef1234567890abcdef12345678",
-    "fromTimestamp": 1700000000,
-    "toTimestamp":   1710000000
+    "from_timestamp": 1700000000,
+    "to_timestamp":   1710000000
   }
 }
 ```
 
-The `requestType` parameter (set by the Executor to `2`) determines routing — the app checks `requestType == common.Deanonymize` and generates a report regardless of payload content. The payload fields above just select **which** report. `address` is required for `tx_history`; `fromTimestamp`/`toTimestamp` are optional (`0` = unbounded).
+The `requestType` parameter (set by the Executor to `2`) determines routing — the app checks `requestType == common.Deanonymize` and generates a report regardless of payload content. The payload fields above just select **which** report. `address` is required for `tx_history`; `from_timestamp`/`to_timestamp` are optional (`0` = unbounded).
 
 ---
 
@@ -774,27 +772,27 @@ Since your code compiles with TinyGo (not standard Go), keep these limitations i
 
 To test this app with the local dev environment:
 
-1. Download `payment_app.wasm` from https://github.com/HorizenOfficial/vela-nova/releases/tag/v0.1.0
+1. Download `payment_app.wasm` from https://github.com/HorizenOfficial/vela-nova/releases/tag/v0.2.0
 3. Start the environment: `cd dockerfiles && cp .env.dev .env && docker compose up`
-4. Download the `nova-linux` wallet from the same release page
+4. Download the `novaw-linux` wallet from the same release page
 5. Configure `wallet.conf` (from `wallet.conf.template`):
     ```
     rpcUrl=http://localhost:8545
-    ProcessorAddress=0xCf7Ed3AccA5a467e9e704C703E8D87F634fB0Fc9
+    ProcessorAddress=0xDc64a140Aa3E981100a9becA4E685f962f0cF6C9
     TeeAuthenticatorAddress=0x9fE46736679d2D9a65F0992F2272dE9f3c7fa6e0
     AuthorityServiceURL=http://localhost:8081
     SubgraphURL=http://localhost:8000/subgraphs/name/hcce
     ```
 6. Set wallet keys:
     - `keySecp256k1`: use an Anvil default private key (accounts are pre-funded with 1000 ETH)
-    - `keyP521`: generate with `./nova-linux generatekeys`
+    - `keyP521`: generate with `./novaw-linux generatekeys`
 7. Deploy and interact:
     ```bash
-    ./nova-linux deployapp --wasm /absolute/path/to/payment_app.wasm --max-value-fee "100 wei" (Use an account with `DEPLOYAPP` role)
-    ./nova-linux registeruser
-    ./nova-linux getpublicbalance
-    ./nova-linux deposit -a "1 ETH"
-    ./nova-linux getprivatebalance
+    ./novaw-linux deployapp --wasm /absolute/path/to/payment_app.wasm --max-value-fee "100 wei" (Use an account with `DEPLOYAPP` role)
+    ./novaw-linux registeruser
+    ./novaw-linux getpublicbalance
+    ./novaw-linux deposit -a "1 ETH"
+    ./novaw-linux getprivatebalance
     ```
 
 ---
@@ -817,6 +815,6 @@ The Executor handles all cryptography (state encryption, event encryption, paylo
 
 | Resource | URL |
 |----------|-----|
-| Vela Nova (test app source) | https://github.com/HorizenOfficial/vela-nova/releases/tag/v0.1.0 |
+| Vela Nova (test app source) | https://github.com/HorizenOfficial/vela-nova/releases/tag/v0.2.0 |
 | Vela Common TS (browser client) | https://github.com/HorizenOfficial/vela-common-ts |
 | Local dev environment | `dockerfiles/` in this repository |

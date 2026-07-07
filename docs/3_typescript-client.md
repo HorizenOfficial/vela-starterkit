@@ -1,4 +1,4 @@
-# Vela TypeScript Client Library (v0.1.0)
+# Vela TypeScript Client Library (v0.2.0)
 
 The `@horizen/vela-common-ts` library provides everything a browser application needs to interact with the Vela CCE platform: key derivation from a wallet, payload encryption, request submission, event decryption, and withdrawal collection. It is designed for browser environments using the Web Crypto API.
 
@@ -171,11 +171,10 @@ const publicKeyHex = await exportPublicKeyToHex(keyPair.publicKey);
 const publicKeyBytes = hexToBytes(publicKeyHex);
 
 // Option B: 226-byte payload (public key + encrypted subtype seed)
-// const publicKeyBytes = await buildAssociateKeyPayload(
-//   keyPair.publicKey,
-//   await client.getTeePublicKey(),
-//   seed,
-// );
+// const seed = generateSeed(secp256k1PrivateKey);          // raw 32-byte secp256k1 key → 65-byte seed
+// const teePubKey = await importPublicKeyFromHex(await client.getTeePublicKey());
+// const encryptedSeed = await encryptSeed(seed, keyPair.privateKey, teePubKey); // 93-byte envelope
+// const publicKeyBytes = await buildAssociateKeyPayload(keyPair.publicKey, encryptedSeed);
 
 const receipt = await client.submitRequestAndWaitForRequestId(
   PROTOCOL_VERSION,          // protocol version
@@ -378,7 +377,8 @@ const events = await fetchAndDecryptUserEvents(
   teePublicKey,
   keyPair.privateKey,
   applicationId,
-  encodeBytes32String("transfer_received"), // eventSubType filter (bytes32 hex)
+  undefined,                                 // requestId filter (or undefined)
+  encodeBytes32String("transfer_received"),  // eventSubType filter (bytes32 hex, or string[])
   10,                                        // limit (0 = no limit)
   (data) => true                             // optional filter on decrypted payload
 );
@@ -494,6 +494,18 @@ console.log("Assigned applicationId:", deployResult?.applicationId);
 ```
 
 The contract derives a fresh `applicationId` from the request hash; you learn the value from the `DeployRequestCompleted` event.
+
+To wire the app to an external trigger contract (which can enqueue `TRUSTPROCESS` requests), use `submitDeployRequestWithTrigger` / `submitDeployRequestWithTriggerAndWaitForRequestId` instead — they take the same arguments plus a `trigger` address:
+
+```typescript
+const receipt = await client.submitDeployRequestWithTriggerAndWaitForRequestId(
+  PROTOCOL_VERSION,
+  maxFee,
+  wasmSha256,
+  undefined,          // constructorParams (undefined if the app needs none)
+  triggerAddress,     // external trigger contract address
+);
+```
 
 ---
 
@@ -618,6 +630,8 @@ import {
 | `submitRequestAndWaitForRequestId(...)` | Same signature as `submitRequest`; waits for receipt and returns `RequestReceipt` |
 | `submitDeployRequest(protocolVersion, maxFeeValue, wasmSha256, constructorParams?)` | Submit a DEPLOYAPP request (caller must hold `DEPLOYER_ROLE`) |
 | `submitDeployRequestAndWaitForRequestId(...)` | Same as `submitDeployRequest`; returns `RequestReceipt` |
+| `submitDeployRequestWithTrigger(protocolVersion, maxFeeValue, wasmSha256, constructorParams, trigger)` | Deploy and register an external `trigger` contract for the app (`ProcessorEndpoint.submitDeployRequestWithTrigger`); the trigger can enqueue `TRUSTPROCESS` requests |
+| `submitDeployRequestWithTriggerAndWaitForRequestId(...)` | Same as `submitDeployRequestWithTrigger`; returns `RequestReceipt` |
 | `approveToken(tokenAddress, amount)` | ERC-20 `approve` for the ProcessorEndpoint (required before non-ETH `submitRequest`) |
 | `encryptForTee(data)` | Encrypt data for the TEE using ECDH |
 | `getTeePublicKey()` | Get the TEE's P-521 public key from the contract |
@@ -653,7 +667,7 @@ import {
 | Export | Description |
 |--------|-------------|
 | `createSubgraphClient(endpoint, timeoutMs)` | Create a subgraph client instance |
-| `fetchAndDecryptUserEvents(client, teePubKey, privKey, appId, subType, limit, filter)` | Fetch and decrypt events with pagination |
+| `fetchAndDecryptUserEvents(client, teePubKey, privKey, appId, requestId, subType, limit, filter?)` | Fetch and decrypt events with pagination (`requestId` may be `undefined`; `subType` is a bytes32 hex or `string[]`) |
 | `userEventSortKey(event)` | Compute sort key for pagination cursor |
 | `MockSubgraphClient` | Mock implementation for testing |
 
@@ -673,7 +687,7 @@ import {
 
 | Export | Description |
 |--------|-------------|
-| `generateSeed(signer, useAltSign?)` | Derive a seed from the wallet (uses `SUBTYPE_KEY_MESSAGE`) |
-| `encryptSeed(seed, teePublicKey, userPrivateKey)` | ECDH-encrypt the seed for inclusion in the 226-byte `ASSOCIATEKEY` payload |
-| `buildAssociateKeyPayload(userPublicKey, teePublicKey, seed)` | Build the 226-byte public-key + encrypted-seed payload |
+| `generateSeed(secp256k1PrivateKey)` | Sign `keccak256(SUBTYPE_KEY_MESSAGE)` with a raw 32-byte secp256k1 private key → 65-byte seed (synchronous) |
+| `encryptSeed(seed, userP521PrivateKey, enclaveP521PublicKey)` | ECDH-encrypt the seed (→ 93-byte envelope) for inclusion in the 226-byte `ASSOCIATEKEY` payload |
+| `buildAssociateKeyPayload(p521PublicKey, encryptedSeed?)` | Build the ASSOCIATEKEY payload: 133 bytes (public key only) or 226 bytes (public key + encrypted seed) |
 | `generateSubtypeSet(seed, n?)` | Produce `n` HMAC-derived sub-type strings from the seed |

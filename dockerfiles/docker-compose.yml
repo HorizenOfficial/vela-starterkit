@@ -21,7 +21,7 @@ volumes:
 
 services:
   executor:
-    image: horizen/cce-executor:${VELA_IMAGE_TAG:-v0.1.0}
+    image: horizen/cce-executor:${VELA_IMAGE_TAG:-v0.2.0}
     container_name: vela-skit-executor
     restart: always
     privileged: true
@@ -53,7 +53,7 @@ services:
     depends_on:
       - chain
   manager:
-    image: horizen/cce-manager:${VELA_IMAGE_TAG:-v0.1.0}
+    image: horizen/cce-manager:${VELA_IMAGE_TAG:-v0.2.0}
     container_name: vela-skit-manager
     restart: always
     privileged: true
@@ -116,7 +116,7 @@ services:
       deployer:
         condition: service_completed_successfully
   authorityservice:
-    image: horizen/cce-authorityservice:${VELA_IMAGE_TAG:-v0.1.0}
+    image: horizen/cce-authorityservice:${VELA_IMAGE_TAG:-v0.2.0}
     container_name: vela-skit-authorityservice
     restart: always
     ports:
@@ -152,7 +152,7 @@ services:
       subgraph-deployer:
         condition: service_completed_successfully
   chain:
-    image: horizen/cce-chain:${VELA_IMAGE_TAG:-v0.1.0}
+    image: horizen/cce-chain:${VELA_IMAGE_TAG:-v0.2.0}
     container_name: vela-skit-chain
     restart: always
     environment:
@@ -167,7 +167,7 @@ services:
     volumes:
       - vela-skit-chain-data:${CHAIN_DATA_FOLDER:-/data}
   deployer:
-    image: horizen/cce-deployer:${VELA_IMAGE_TAG:-v0.1.0}
+    image: horizen/cce-deployer:${VELA_IMAGE_TAG:-v0.2.0}
     container_name: vela-skit-deployer
     restart: "no"
     environment:
@@ -268,7 +268,7 @@ services:
       retries: 30
       start_period: 20s
   subgraph-deployer:
-    image: horizen/cce-subgraph-deployer:${VELA_IMAGE_TAG:-v0.1.0}
+    image: horizen/cce-subgraph-deployer:${VELA_IMAGE_TAG:-v0.2.0}
     container_name: vela-skit-subgraph-deployer
     restart: "no"
     environment:
