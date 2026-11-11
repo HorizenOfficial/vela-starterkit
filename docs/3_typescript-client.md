@@ -1,4 +1,4 @@
-# Vela TypeScript Client Library (v0.2.0)
+# Vela TypeScript Client Library (v0.3.0)
 
 The `@horizen/vela-common-ts` library provides everything a browser application needs to interact with the Vela CCE platform: key derivation from a wallet, payload encryption, request submission, event decryption, and withdrawal collection. It is designed for browser environments using the Web Crypto API.
 
@@ -15,6 +15,8 @@ npm install @horizen/vela-common-ts ethers
 ```
 
 The package is published under the `@horizen/` scope. `ethers` v6 is a peer dependency (used for wallet integration and contract interaction).
+
+> **Compatibility:** version 0.3.0 of the library targets the Vela v0.3.0 contracts. Vela is deployed on Base (Base Sepolia for testing); any chain it runs on must be at the Cancun hardfork or later.
 
 ---
 
@@ -57,10 +59,12 @@ import { VelaClient } from "@horizen/vela-common-ts";
 const client = new VelaClient(
   signer,
   false,                          // useAlternativeSign (true for eth_sign RPC)
-  "0x<TeeAuthenticator address>", // TEE Authenticator contract
-  "0x<ProcessorEndpoint address>"  // Processor Endpoint contract
+  "0x<TeeAuthenticator address>", // TEE Authenticator contract (proxy)
+  "0x<ProcessorEndpoint address>"  // Processor Endpoint contract (proxy)
 );
 ```
+
+`ProcessorEndpoint`, `TeeAuthenticator` and `AuthorityRegistry` run behind UUPS proxies: always pass the **proxy** addresses, not the implementation addresses. They stay the same across contract upgrades.
 
 The client wraps both smart contracts and handles key derivation, encryption, and decryption internally.
 
@@ -68,8 +72,8 @@ The client wraps both smart contracts and handles key derivation, encryption, an
 |-----------|-------------|
 | `signer` | ethers.js Signer from the user's wallet |
 | `useAlternativeSign` | Use `eth_sign` RPC method instead of `signMessage()`. Set `true` if the wallet doesn't support EIP-191 personal_sign |
-| `teeAuthenticatorAddress` | On-chain address of the TEE Authenticator contract |
-| `processorEndpointAddress` | On-chain address of the Processor Endpoint contract |
+| `teeAuthenticatorAddress` | On-chain (proxy) address of the TEE Authenticator contract |
+| `processorEndpointAddress` | On-chain (proxy) address of the Processor Endpoint contract |
 
 ---
 
@@ -262,9 +266,12 @@ enum RequestType {
   DEPLOYAPP = 0,       // deploy a new WASM application
   PROCESS = 1,         // standard request (transfer, withdraw, etc.)
   DEANONYMIZATION = 2, // request a deanonymization report
-  ASSOCIATEKEY = 3     // register a P-521 public key
+  ASSOCIATEKEY = 3,    // register a P-521 public key
+  TRUSTPROCESS = 4     // created on-chain by an app's trigger contract
 }
 ```
+
+`TRUSTPROCESS` requests show up in `RequestSubmitted` events but cannot be submitted directly: `submitRequest` reverts with `InvalidRequestType`, as it does for `DEPLOYAPP`.
 
 ### Deposit (Funding Your Account)
 
@@ -297,13 +304,41 @@ const result = await client.getRequestCompletedEvent(
   deployBlock     // toBlock (earliest end of range)
 );
 
-if (result) {
-  console.log("Status:", result.status);         // 0n = success
+if (result) {                                     // undefined if not completed yet
+  console.log("Status:", result.status);         // 0n = completed, 1n = failed
+  console.log("Error code:", result.errorCode);  // 0n (ErrorCode.NO_ERROR) if success
   console.log("Error:", result.errorMessage);     // undefined if success
 }
 ```
 
 > Note: `fromBlock` is the upper bound and `toBlock` is the lower bound of the block range to search.
+
+Several requests of the same application can be settled in a single transaction (batch execution). Each request still gets its own `RequestCompleted`, `UserEvent`, `AppEvent`, `Refund` and `Withdrawal` events, so lookups by `requestId` work as usual — but do not assume one completed request per transaction or per block. Trigger requests, deploys and requests of apps with a trigger contract are always settled one per transaction.
+
+Requests are also not processed in global submission order: each application has its own queue, trigger requests are served first, then deploys, then applications take turns. Within one application, requests are processed in submission order.
+
+### Error Codes
+
+`ErrorCode` mirrors the contracts' `Structs.ErrorCode`. `RequestResult.errorCode` is a `bigint` and the subgraph's `errorCode` is a `number`; compare with e.g. `Number(result.errorCode) === ErrorCode.WRONG_KEY_SENT`.
+
+```typescript
+enum ErrorCode {
+  NO_ERROR = 0,
+  UNKNOWN = 1,
+  INTERNAL = 2,
+  APPLICATION_ALREADY_DEPLOYED = 3,
+  FUNCTION_NOT_FOUND = 4,
+  DEPOSIT_FAILED = 5,
+  REQUEST_FUNC_FAILED = 6,
+  WRONG_KEY_SENT = 7,
+  PUB_KEY_NOT_REGISTERED = 8,
+  NO_REPORT_DATA_FOUND = 9,
+  WASM_INTERNAL = 10,
+  INSUFFICIENT_FUEL = 11
+}
+```
+
+`APP_NOT_DEPLOYED` no longer exists, so every code from `WRONG_KEY_SENT` onward is one lower than in Vela v0.2.0. An oversized application state is reported as `REQUEST_FUNC_FAILED` and a guest execution timeout as `WASM_INTERNAL`; `errorMessage` gives the detail (e.g. `guest execution timed out`).
 
 ---
 
@@ -636,13 +671,20 @@ import {
 | `encryptForTee(data)` | Encrypt data for the TEE using ECDH |
 | `getTeePublicKey()` | Get the TEE's P-521 public key from the contract |
 | `getSignerKeyPair()` | Derive the user's P-521 key pair from their wallet |
-| `getRequestCompletedEvent(requestId, fromBlock, toBlock)` | Query for PROCESS/DEANONYMIZATION/ASSOCIATEKEY completion (returns `RequestResult`) |
+| `getRequestCompletedEvent(requestId, fromBlock, toBlock)` | Query for PROCESS/DEANONYMIZATION/ASSOCIATEKEY/TRUSTPROCESS completion (returns `RequestResult`, whose `errorCode` is `0n` on success) |
 | `getDeployRequestCompletedEvent(applicationId?, requestId?, fromBlock, toBlock)` | Query for DEPLOYAPP completion |
 | `getCurrentUserEvents(fromBlock, toBlock, applicationId, requestId, eventSubType, filter, stopAtFirst)` | Get and decrypt per-user `UserEvent`s. `eventSubType` is a `bytes32` hex (use `ethers.encodeBytes32String`). |
 | `getAppEvents(fromBlock, toBlock, applicationId, requestId?, eventSubType?)` | Get plaintext application-level `AppEvent`s |
 | `decryptAndFilterEvents(events, filter, stopAtFirst)` | Decrypt and filter raw contract events |
 | `getPendingClaims(tokenAddress, payee)` | Check pending withdrawal balance per token for an address |
 | `claim(tokenAddress, payee)` | Execute pull-payment claim of pending balance |
+
+### Enums
+
+| Export | Description |
+|--------|-------------|
+| `RequestType` | `DEPLOYAPP`, `PROCESS`, `DEANONYMIZATION`, `ASSOCIATEKEY`, `TRUSTPROCESS` (see [Request Types](#request-types)) |
+| `ErrorCode` | Mirrors `Structs.ErrorCode` (see [Error Codes](#error-codes)) |
 
 ### Crypto Exports
 

@@ -1,4 +1,4 @@
-# Building a Trigger-Contract App on Vela (v0.2.0)
+# Building a Trigger-Contract App on Vela (v0.3.0)
 
 This document walks through the implementation of a WASM application that drives an **external trigger contract** — the `TRUSTPROCESS` / `trusted_request` flow. The example is an **anonymous execution pool** ("mixer"): users deposit funds into a shared on-chain pool, then ask the app to perform an arbitrary on-chain call on their behalf. The call is executed by a trigger contract from the *pool's* address (not the user's), and whatever is left unspent is credited back to the user's private balance inside the TEE.
 It shows code snippets in the GO language.
@@ -36,7 +36,7 @@ A trigger app differs from a normal app in one structural way: a user request do
         - trigger.withdraw()                 → sweeps the leftover back to the endpoint
         - trigger.getTrustProcessPayload(...) → returns ABI-encoded (lockId, remain, outcome)
         - if that payload is non-empty → enqueues a TRUSTPROCESS request
-3. (automatic) Manager picks up the TRUSTPROCESS (trigger queue has priority) →
+3. (automatic) Manager picks up the TRUSTPROCESS (trigger queue is served first) →
       Executor → trusted_request(payload, state)
         app decodes (lockId, remain, outcome), credits `remain` back to the owner,
         emits NO AppEvents → the trigger returns "" → the loop terminates.
@@ -45,6 +45,8 @@ A trigger app differs from a normal app in one structural way: a user request do
 The two rules that keep this safe and finite:
 - **The trigger only enqueues a `TRUSTPROCESS` when `getTrustProcessPayload` returns non-empty bytes.**
 - **A `TRUSTPROCESS` carries no `AppEvent`s.** The trigger guards on `appEventData.events.length == 0` and returns `""`, so a trusted request can never spawn another one. This is the loop terminator — every trigger you write must honor it.
+
+Requests of an app with a trigger contract are never batched: each one is settled in its own `stateUpdate` transaction (a `batchStateUpdate` for such an app reverts with `BatchNotAllowed`), so the trigger callbacks always run for exactly one request.
 
 ---
 
@@ -78,12 +80,12 @@ module github.com/yourorg/vela-mixer
 
 go 1.24
 
-require github.com/HorizenOfficial/vela-common-go v0.2.0
+require github.com/HorizenOfficial/vela-common-go v0.3.0
 ```
 
 | Package | Provides |
 |---------|----------|
-| `vela-common-go/wasm/types` | Core types (`Address`, `Uint256`, `PlainEvent`, `AppEvent`, `Withdrawal`), result types (`DeployResult`, `LoadModuleResult`, `DepositResult`, `ProcessResult`), helpers (`SerializeAndWriteResult`, `PtrToAddress`, `PtrToUint256`, `HexToAddress`, `NewUint256`) |
+| `vela-common-go/wasm/types` | Core types (`Address`, `Uint256`, `PlainEvent`, `AppEvent`, `Withdrawal`), result types (`DeployResult`, `DepositResult`, `ProcessResult`), helpers (`SerializeAndWriteResult`, `PtrToAddress`, `PtrToUint256`, `HexToAddress`, `NewUint256`) |
 | `vela-common-go/wasm/utils` | Memory management (`allocate`/`deallocate`, `BytesToPtr`, `get_allocated_memory_stats`), `PtrToString`, logging (`LogError/Warn/Info/Debug/Trace`) |
 
 ### Makefile
@@ -92,10 +94,10 @@ require github.com/HorizenOfficial/vela-common-go v0.2.0
 APP := mixer_app
 
 build:
-	tinygo build -o build/$(APP).wasm -target=wasi .
+	tinygo build -o build/$(APP).wasm -target=wasip1 .
 
 production_build:
-	tinygo build -o production_build/$(APP).wasm -opt=s -no-debug -target=wasi .
+	tinygo build -o production_build/$(APP).wasm -opt=s -no-debug -target=wasip1 .
 ```
 
 The target is always `wasi`. The trigger app compiles exactly like any other Vela WASM app — exporting `trusted_request` requires nothing special in the build.
@@ -184,12 +186,6 @@ import (
 func deploy(appId int64, paramsPtr *byte, paramsLen int32) *byte {
     paramsJSON := utils.PtrToString(paramsPtr, paramsLen)
     result := app.Deploy(appId, paramsJSON)
-    return types.SerializeAndWriteResult(result)
-}
-
-//export load_module
-func load_module(appId int64) *byte {
-    result := app.LoadModule(appId)
     return types.SerializeAndWriteResult(result)
 }
 
@@ -302,17 +298,6 @@ func newInitialState(appId int64, trigger string) *ApplicationInternalState {
         Locks:          make(map[string]*Lock),
         TriggerAddress: trigger,
     }
-}
-```
-
-### LoadModule — Cache Warm-Up Fallback
-
-Same minimal state, with no trigger configured. The Executor calls this only to rebuild its default-state cache on restart; apps never call it themselves.
-
-```go
-func LoadModule(appId int64) types.LoadModuleResult {
-    stateJSON, _ := json.Marshal(newInitialState(appId, ""))
-    return types.LoadModuleResult{State: stateJSON, Fuel: types.NewUint256(5)}
 }
 ```
 
@@ -739,7 +724,7 @@ A trigger app emits both kinds of Vela events, for different purposes:
 
 | Operation | Fuel |
 |-----------|------|
-| `Deploy` / `LoadModule` | 5 |
+| `Deploy` | 5 |
 | `Deposit` | 35 |
 | `ProcessRequest` (execute) | 60 |
 | `TrustedRequest` | 50 |
@@ -767,7 +752,7 @@ A trigger app requires the trigger address to be registered in **two** places (s
 2. **In the WASM state**, via the deploy descriptor's `constructorParams`: the same address is passed as `{"triggerContract":"0x…"}`, so the app can stamp it into `Withdrawal.DestinationAddress`.
 
 ```
-1. Deploy MixerTrigger(processorEndpoint)                     → triggerAddr
+1. Deploy MixerTrigger(processorEndpoint proxy address)       → triggerAddr
 2. Upload mixer_app.wasm to the Authority Service             → sha256
 3. submitDeployRequestWithTrigger(
        protocolVersion,

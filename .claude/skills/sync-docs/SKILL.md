@@ -30,8 +30,9 @@ Record the four refs — you will quote them in the findings report.
 ### 2. Flag version mismatches
 
 Extract version strings from the docs:
-- `CLAUDE.md` declares `**Current version: v0.2.0**` and states all Docker images are tagged `v0.2.0`.
-- `README.md`, `dockerfiles/.env.dev`, and the docs pages may also pin a version.
+- `CLAUDE.md` declares `**Current version: vX.Y.Z**` and states all Docker images are tagged with that version.
+- `dockerfiles/docker-compose.yml` pins the default image tag (`${VELA_IMAGE_TAG:-vX.Y.Z}`).
+- `README.md`, `dockerfiles/README.md`, `dockerfiles/.env.dev`, and the docs pages (titles, `go.mod` snippets, release links) may also pin a version.
 
 Compare those declarations to the refs recorded in step 1. If any sibling repo is checked out at a different tag/branch than the docs claim, list it as a finding. Do not silently "fix" the version string — the mismatch itself is information the user needs.
 
@@ -43,23 +44,29 @@ Use Glob for `**/*.md`, excluding `.git`, `node_modules`, and any `.claude/` fil
 - `docs/1_summary.md`
 - `docs/2_private-transfer-app.md`
 - `docs/3_typescript-client.md`
+- `docs/4_trigger-contract-app.md`
 - `dockerfiles/README.md`
 
 If Glob returns files you don't recognize, audit them too.
+
+Also audit the non-markdown local environment files:
+- `dockerfiles/docker-compose.yml` — image tags, and the env vars passed to each service compared with `../vela/dockerfiles/docker-compose.yml` at the matching tag (new config vars must be passed through).
+- `dockerfiles/.env.dev` — compared with `../vela/dockerfiles/.env.dev` / `.env.template`. If reading it is denied by permissions, say so and list what the user must check manually.
 
 ### 4. Audit each doc against the sibling repos
 
 For every file, read it end-to-end and check each factual claim against the relevant sibling repo. Claims worth verifying include (non-exhaustive):
 
 **WASM interface (check against `vela-common-go/wasm/types/` and the `vela-nova` exports):**
-- Exported function names and signatures (`load_module`, `deposit`, `process_request`, etc.)
+- Exported function names and signatures (`deploy`, `deposit`, `process_request`, `trusted_request`, etc.) — the authoritative list is `../vela/docs/design/WASM_HOST_ABI.md` ("Exports the guest must provide")
 - `requestType` routing values and what each maps to
 - Struct field names, types, and ordering for `Address`, `Uint256`, `PlainEvent`, `Withdrawal`, `ProcessResult`, and any other referenced types
 - Optional vs required fields (e.g. `ProcessResult.Report`)
 
 **Core platform (check against `vela/`):**
 - Manager / Executor / deployer / authority-service behavior
-- Smart contract names, functions, events, and addresses
+- Smart contract names, functions, events, and addresses. The dev contract addresses in `dockerfiles/README.md` and `docs/2_private-transfer-app.md` follow the deploy order in `../vela/contracts/scripts/deploy/all.ts`; confirm them from the deployer log of a fresh run (`docker logs vela-skit-deployer`) — a log saying "already deployed … Skipping" means the volumes are stale and the addresses are not current
+- Changelogs: `../vela/CHANGELOG.md`, `../vela-nova/CHANGELOG.md`, `../vela-common-go/CHANGELOG.md` list breaking changes per release — use them as a checklist of what to look for
 - Crypto primitives and key-derivation flows
 - Environment variables, especially `EXECUTOR_KEYSET_RECOVERY_TYPE` and anything referenced in `dockerfiles/.env.dev`
 - Container names, volume prefixes (`vela-skit-*`), network range (`10.10.40.0/24`), exposed ports (`8545`, `8081`, `8000`)
@@ -67,7 +74,7 @@ For every file, read it end-to-end and check each factual claim against the rele
 
 **TypeScript client (check against `vela-common-ts/`):**
 - Class name (`VelaClient` — renamed from `HorizenCCEClient` in v0.0.25)
-- Package name (`vela-common-ts` — renamed from `horizen-cce-common-ts`)
+- Package name (`@horizen/vela-common-ts`, see its `package.json` — renamed from `horizen-cce-common-ts`)
 - Public API surface, method names and signatures
 - Key-derivation and encryption flows
 - Subgraph query shapes

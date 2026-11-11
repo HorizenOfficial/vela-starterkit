@@ -1,4 +1,4 @@
-# Vela - Architecture Summary (v0.2.0)
+# Vela - Architecture Summary (v0.3.0)
 
 ## 1. System Overview
 
@@ -60,18 +60,23 @@ Vela  is a platform that executes WebAssembly (WASM) modules inside AWS Nitro En
 
 The on-chain layer coordinates request submission, TEE attestation and state management.
 
+`ProcessorEndpoint`, `TeeAuthenticator` and `AuthorityRegistry` are deployed behind UUPS proxies and configured through `initialize(...)` rather than constructors. Always use the **proxy** address — it stays the same across contract upgrades. (In dev mode, `TEE_NO_ATTESTATION=true`, the deployer uses a non-proxied `NoAttestationTeeAuthenticator`.) The contracts target the `cancun` EVM version, so the chain must be at the Cancun hardfork or later; Vela is deployed on Base (Base Sepolia for testing).
+
 #### ProcessorEndpoint
 
-The primary contract. Manages a FIFO request queue and processes state updates.
+The primary contract. Manages the request queues and processes state updates. To stay under the EIP-170 contract size limit, off-hot-path entry points live in a separate `ProcessorEndpointExtension` contract, reached via `delegatecall` with the same ABI (its address is exposed by `extension()`).
+
+- **Request queues**: each application has its own queue. Trigger (`TRUSTPROCESS`) requests and deploys go into global queues that are served first; applications are then served round-robin. Within one application requests are processed in submission order, but not across applications. The Manager reads the next batch via `getPendingRequestsWithStateRoot(maxCount)`; single requests can be looked up with `requestById(id)`.
 
 - **Request submission** (`submitRequest`): Users enqueue `PROCESS`, `DEANONYMIZATION` or `ASSOCIATEKEY` requests. Each request carries an application ID, request type, encrypted payload, a token address (`0x0` = native ETH), an asset amount, and a max fee. `DEPLOYAPP` and `TRUSTPROCESS` are rejected here (`InvalidRequestType`) — deployments use a separate entry point, and trigger-driven `TRUSTPROCESS` requests are submitted by trigger contracts.
-- **Meta-transaction submission** (`submitRequestFor`): A facilitator submits a `PROCESS` or `ASSOCIATEKEY` request on behalf of an end user. The user signs an EIP-712 authorization (`REQUEST_AUTHORIZATION_TYPEHASH`) covering `sender`, protocol version, application ID, request type, payload hash, token address, asset amount, nonce, and deadline; the facilitator pays gas and the fee via `msg.value`. Per-user nonces (`facilitatorNonces[sender]`) provide replay protection and are readable via `getFacilitatorNonce(user)`. ERC-20 asset transfer uses EIP-2612 `permit` + `transferFrom` — the `depositPermit` field decodes to `(uint8 v, bytes32 r, bytes32 s)`. The resulting `PendingRequest.sender` is the end user; `PendingRequest.facilitator` is the caller.
+- **Meta-transaction submission** (`submitRequestFor`): A facilitator submits a `PROCESS` or `ASSOCIATEKEY` request on behalf of an end user. The user signs an EIP-712 authorization (`REQUEST_AUTHORIZATION_TYPEHASH`) covering `sender`, protocol version, application ID, request type, payload hash, token address, asset amount, nonce, and deadline; the facilitator pays gas and the fee via `msg.value`. Per-user nonces (`facilitatorNonces[sender]`) provide replay protection and are readable via the public getter `facilitatorNonces(user)`. ERC-20 asset transfer uses EIP-2612 `permit` + `transferFrom` — the `depositPermit` field decodes to `(uint8 v, bytes32 r, bytes32 s)`. The resulting `PendingRequest.sender` is the end user; `PendingRequest.facilitator` is the caller.
 - **Deploy submission** (`submitDeployRequest`): Restricted to addresses with `DEPLOYER_ROLE`. Takes a protocol version and a deploy descriptor payload referencing the WASM artifact by its `sha256`. A unique `applicationId` is derived from the request ID for each deploy. A `submitDeployRequestWithTrigger` variant additionally wires the app to an external trigger contract that can enqueue `TRUSTPROCESS` requests.
-- **State update** (`stateUpdate`): Called by the Manager after execution. Verifies the TEE signature, updates the on-chain state root, emits encrypted events, processes withdrawals and refunds via pull-payment claims and sends calls to the app's trigger contract, if present. The TEE also reports success/failure inline via `errorCode` + `errorMsg`.
+- **State update** (`stateUpdate`): Called by the Manager after execution. Verifies the TEE signature, updates the on-chain state root, emits encrypted events, processes withdrawals and refunds via pull-payment claims and sends calls to the app's trigger contract, if present. The TEE also reports success/failure inline via `errorCode` + `errorMsg`. The contract enforces the round-robin turn: updating an application other than the selected one reverts with `ApplicationNotSelected`, and skipping a non-empty priority queue reverts with `PriorityQueueNotServed`. Queue heads younger than `selectionGrace` (default 60 s, set via `updateSelectionGrace`) are ignored when checking the turn.
+- **Batch state update** (`batchStateUpdate`): Settles up to `MAX_BATCH_SIZE` requests of one application in a single transaction, with one TEE signature over all entries. Emits `BatchProcessed(applicationId, entryHashes)`, and each request still emits its own `RequestCompleted`, `UserEvent`, `AppEvent`, `Refund` and `Withdrawal` events. Trigger requests, deploys and requests of apps with a trigger contract are always settled one per transaction.
 - **Claims** (`claim`, `pendingClaims`): Withdrawal and refund amounts are credited to per-token pull-payment balances; recipients call `claim(tokenAddress, payee)` to collect.
-- **ERC-20 support**: For non-ETH tokens the caller must `approve` the `ProcessorEndpoint` up to `assetAmount` before calling `submitRequest`; tokens are pulled via `safeTransferFrom`. Only tokens in the `TokenAllowlist` are accepted — as of v0.2.0 this is a standalone contract injected into `ProcessorEndpoint` via the constructor (exposed as `tokenAllowlist()`), rather than internal endpoint state.
-- **Access control**: `UPDATE_STATUS_ROLE` for state updates; `DEPLOYER_ROLE` for deploy submissions; `ADMIN` for configuration; `RESET_OPERATOR` for the admin reset functions.
-- **Admin reset** (`adminReset`, `adminResetApps`): Queue/app reset restricted to `RESET_OPERATOR`. Testnet/dev only — the role can only be granted at deployment and is permanently disabled in production (the constructor is passed `resetOperator = address(0)`).
+- **ERC-20 support**: For non-ETH tokens the caller must `approve` the `ProcessorEndpoint` up to `assetAmount` before calling `submitRequest`; tokens are pulled via `safeTransferFrom`. Only tokens in the `TokenAllowlist` are accepted — a standalone contract passed to `ProcessorEndpoint.initialize` (exposed as `tokenAllowlist()`), rather than internal endpoint state.
+- **Access control**: `UPDATE_STATUS_ROLE` for state updates; `DEPLOYER_ROLE` for deploy submissions; `ADMIN` for configuration; `RESET_OPERATOR` for the admin reset functions. `ADMIN` and `UPDATE_STATUS_ROLE` can be rotated and revoked.
+- **Admin reset** (`adminReset`, `adminResetApps`): Queue/app reset restricted to `RESET_OPERATOR`. Testnet/dev only — the role can only be granted at initialization and is permanently disabled in production (`initialize` is passed `resetOperator = address(0)`).
 
 Key data structures:
 ```solidity
@@ -96,16 +101,16 @@ struct WithdrawalRequest {
 }
 ```
 
-Events: `RequestSubmitted` (carries `facilitator`), `RequestCompleted`, `DeployRequestSubmitted`, `DeployRequestCompleted`, `StateRootUpdate`, `UserEvent` (encrypted, per-user), `AppEvent` (plaintext, application-level), `Refund` (with `tokenAddress`), `Withdrawal` (with `tokenAddress`), `ReportGenerated`, `PaymentWithdrawn`, `TriggerExecuted`, `TriggerWithdraw`.
+Events: `RequestSubmitted` (carries `facilitator`), `RequestCompleted`, `DeployRequestSubmitted`, `DeployRequestCompleted`, `StateRootUpdate`, `UserEvent` (encrypted, per-user), `AppEvent` (plaintext, application-level), `Refund` (with `tokenAddress`), `Withdrawal` (with `tokenAddress`), `ReportGenerated`, `PaymentWithdrawn`, `TriggerExecuted`, `TriggerWithdraw`, `BatchProcessed`, `SelectionGraceUpdated`.
 
 #### TeeAuthenticator
 
 Manages TEE identity. Verifies AWS Nitro Enclave attestation documents against expected PCR0 values and registers the TEE's signing address and P521 public key. In development mode, a `NoAttestationTeeAuthenticator` variant is used to bypass Nitro attestation requirements.
 
 - **Multi-step attestation** (`updateTeeStep1`..`4`): Breaks large attestation verification across multiple transactions to fit gas limits.
-- **Signature verification** (`checkSignature`): Called by ProcessorEndpoint during `stateUpdate`. Recovers the signer from an ECDSA signature and verifies it matches the registered TEE address.
+- **Signature verification** (`checkSignature`, `checkBatchSignature`): Called by ProcessorEndpoint during `stateUpdate` / `batchStateUpdate`. Recovers the signer from an ECDSA signature and verifies it matches the registered TEE address.
 
-The signed message covers: `applicationId`, `prevStateRoot`, `newStateRoot`, `processedRequestId`, `hash(userEvents)`, `hash(userEventSubTypes)`, `hash(appEvents)`, `hash(appEventSubTypes)`, `hash(withdrawalRequests)`, `refundAmount`, `applicationFee`, `errorCode`, `errorMsg`. UserEvents and AppEvents are hashed separately, and each kind contributes a data hash plus a subtype hash.
+Each request in an update produces an **entry hash** (keccak256 of its ABI-encoded fields); the TEE signs the concatenation of all entry hashes once (EIP-191 personal_sign). For a single request this is the same signature as signing its entry hash alone. Each entry hash covers: `applicationId`, `prevStateRoot`, `newStateRoot`, `processedRequestId`, `hash(userEvents)`, `hash(userEventSubTypes)`, `hash(appEvents)`, `hash(appEventSubTypes)`, `hash(withdrawalRequests)`, `refundAmount`, `applicationFee`, `errorCode`, `errorMsg`. UserEvents and AppEvents are hashed separately, and each kind contributes a data hash plus a subtype hash.
 
 #### AuthorityRegistry & DefaultAuthority
 
@@ -128,15 +133,18 @@ The Manager runs outside the enclave and orchestrates the entire execution flow.
 **Main processing loop** (`pollBlockchain`):
 ```
 every N seconds:
-  1. Fetch next pending request from ProcessorEndpoint
+  1. Fetch up to MAX_BATCH_SIZE pending requests of the contract-selected application
+     (getPendingRequestsWithStateRoot), plus that application's on-chain state root
   2. Compare on-chain state root with local state root
      - If mismatch: detect chain reorg → rollback or fatal
-  3. Route request by type:
-     - Deploy  → send WASM to Executor, store initial state
-     - Process / Deanonymize / AssociateKey → load state + WASM, send to Executor
-  4. Store new encrypted state in LevelDB
-  5. Submit signed UpdatePayload to blockchain
-  6. On failure: rollback state, call stateUpdate with errorCode + errorMsg to mark the request failed on-chain
+  3. Route by type:
+     - Deploy (always alone) → send WASM to Executor, store initial state
+     - Process / Deanonymize / AssociateKey / TrustProcess → load state + WASM,
+       send the whole batch to the Executor in one round-trip
+  4. Store the final encrypted state in LevelDB
+  5. Submit all signed UpdatePayloads with one batchStateUpdate transaction
+  6. Failed requests are settled on-chain with errorCode + errorMsg; if the Executor stops
+     early (hard failure) the remaining requests stay pending and are retried next poll
 ```
 
 **Key interfaces:**
@@ -189,9 +197,9 @@ The Executor runs inside the AWS Nitro Enclave (TEE) and handles all cryptograph
 2. If found: restore keys from encrypted recovery blob
 3. If not found: generate new keyset, send encrypted recovery to Manager for storage
 
-**Request processing pipeline** (`HandleProcessRequest`):
+**Request processing pipeline** (`HandleBatchProcessRequest`, run for each request of a batch in order, each one starting from the state left by the previous one):
 ```
-1. Decrypt application state (AES-256 with StateKey)
+1. Decrypt application state (AES-256 with StateKey); reject it if larger than EXECUTOR_MAX_APP_STATE_SIZE
 2. Deserialize into AppData (state + user key store)
 3. If assetAmount > 0: call WASM deposit()
 4. If AssociateKey: register sender's P521 public key (+ optional encrypted subtype seed)
@@ -203,9 +211,12 @@ The Executor runs inside the AWS Nitro Enclave (TEE) and handles all cryptograph
 7. For each `PlainEvent` entry, if the target user has provided a subtype seed, compute eventSubType
 8. Encrypt `PlainEvent` entries using recipient P521 public keys (ECDH → AES-GCM); `AppEvent` entries pass through as plaintext
 9. If Deanonymize: validate that report data is present in the response
-10. Sign UpdatePayload with secp256k1 SigningKey
-11. Return: UpdatePayload + encrypted ApplicationState + optional DeanonymizationReport
+10. Compute the entry hash of the UpdatePayload
+After the last request: sign all entry hashes once with the secp256k1 SigningKey and
+return the UpdatePayloads + batch signature + final encrypted ApplicationState + optional DeanonymizationReports
 ```
+
+Each WASM call runs on a fresh guest instance and is bounded by `EXECUTOR_GUEST_EXECUTION_TIMEOUT_MS` (default 10 s); a guest that exceeds it is interrupted and the request fails on-chain with `WASM_INTERNAL` (`guest execution timed out`). A new state larger than `EXECUTOR_MAX_APP_STATE_SIZE` (default 10 MiB) fails the request with `REQUEST_FUNC_FAILED` (`APP_STATE_TOO_LARGE`) and leaves the state unchanged. See [4.9](#49-application-side-constraints).
 
 ---
 
@@ -235,7 +246,7 @@ Deployer                 Blockchain              Manager                Executor
   │                          │                      │── load WASM by sha256│
   │                          │                      │── SendDeployApp ────>│
   │                          │                      │                      │─ compile WASM
-  │                          │                      │                      │─ call load_module()
+  │                          │                      │                      │─ call deploy()
   │                          │                      │                      │─ encrypt initial state
   │                          │                      │                      │─ sign payload
   │                          │                      │<─ UpdatePayload ─────│
@@ -293,7 +304,7 @@ The trigger callbacks all run inside `stateUpdate`, in strict order, each in an 
 3. **`withdraw()`** — a non-overridable sweep returns all ERC-20 + ETH balances from the trigger back to the endpoint's custody (funds "re-shielded").
 4. **`getTrustProcessPayload(...)`** — the trigger returns a `bytes` payload. A **non-empty** return enqueues a new `TRUSTPROCESS` request; empty means none. Emits `TriggerWithdraw`.
 
-The `TRUSTPROCESS` request goes into a **separate, higher-priority trigger queue**: `getNextPendingRequest` drains trigger requests before normal ones. The Executor treats it specially — the payload is clear text (**not** ECDH-decrypted), the min-fee check is skipped, and the application fee is `0` (authenticity is established on-chain, not by an end-user signature). It is routed to the WASM `trusted_request` export, which receives **no sender and no `requestType`**. Its `stateUpdate` can invoke the trigger again, so the round-trip can chain.
+The `TRUSTPROCESS` request goes into a **separate, higher-priority trigger queue**: `getPendingRequestsWithStateRoot` serves trigger requests before deploys and normal ones, and each is settled in its own transaction (never batched). The Executor treats it specially — the payload is clear text (**not** ECDH-decrypted), the min-fee check is skipped, and the application fee is `0` (authenticity is established on-chain, not by an end-user signature). It is routed to the WASM `trusted_request` export, which receives **no sender and no `requestType`**. Its `stateUpdate` can invoke the trigger again, so the round-trip can chain.
 
 ```
 Trigger contract          Blockchain              Manager                Executor
@@ -366,27 +377,6 @@ func deploy(appId int64, paramsPtr *byte, paramsLen int32) *byte {
 Returns `DeployResult`:
 ```go
 type DeployResult struct {
-    State []byte   `json:"state"`   // JSON-serialized initial state
-    Fuel  *Uint256 `json:"fuel"`    // Fuel units consumed
-    Error string   `json:"error,omitempty"`
-}
-```
-
-#### `load_module(appId: i64) -> *byte`
-
-Retained for cache warm-up on Executor restart (the host calls it to rebuild the default-initial-state cache entry without re-running the constructor). New deployments use `deploy` — apps should treat `load_module` as a fallback that produces a minimal default state with no constructor input.
-
-```go
-//export load_module
-func load_module(appId int64) *byte {
-    result := myapp.LoadModule(appId)
-    return types.SerializeAndWriteResult(result)
-}
-```
-
-Returns `LoadModuleResult`:
-```go
-type LoadModuleResult struct {
     State []byte   `json:"state"`   // JSON-serialized initial state
     Fuel  *Uint256 `json:"fuel"`    // Fuel units consumed
     Error string   `json:"error,omitempty"`
@@ -529,7 +519,7 @@ The Executor routes requests by type to the appropriate WASM export:
 
 | Value | Type | Submitted via | WASM Export Called |
 |-------|------|--------------|-------------------|
-| 0 | `DEPLOYAPP` | `submitDeployRequest` / `submitDeployRequestWithTrigger` (DEPLOYER_ROLE only) | `load_module` |
+| 0 | `DEPLOYAPP` | `submitDeployRequest` / `submitDeployRequestWithTrigger` (DEPLOYER_ROLE only) | `deploy` |
 | 1 | `PROCESS` | `submitRequest` | `deposit` (if `assetAmount > 0`) + `process_request(requestType=1)` |
 | 2 | `DEANONYMIZATION` | `submitRequest` (AuthorityRegistry-gated) | `process_request(requestType=2)` — app returns report in `ProcessResult.Report` |
 | 3 | `ASSOCIATEKEY` | `submitRequest` | None (handled entirely by the Executor) |
@@ -580,9 +570,13 @@ When the request type is `DEANONYMIZATION` (value 2), the Executor calls `proces
 ### 4.9 Application-side Constraints
 
 - **TinyGo limitations**: Not all Go stdlib packages are available. Avoid `reflect`-heavy code, `net`, `os` (beyond basics), etc.
-- **Stateless execution**: All state must be serialized/deserialized each call. No global mutable state persists between invocations.
+- **Stateless execution**: Every guest call runs on a fresh instance, so globals are reset on every call. All state must be serialized/deserialized each call and passed through the state parameter.
 - **Determinism**: Results must be deterministic for the same inputs. Avoid `time.Now()`, random number generation, or other non-deterministic operations.
-- **Memory**: Implement `allocate`/`deallocate` in your `utils` package. The host manages memory lifecycle via these exports.
+- **Allowed host imports**: Only these WASI imports may be declared: `args_get`, `args_sizes_get`, `clock_time_get`, `environ_get`, `environ_sizes_get`, `fd_write`, `proc_exit`, `random_get` (what TinyGo emits for a guest that does no I/O). A module declaring anything else is refused at deploy — e.g. linking `time.Sleep` anywhere reachable imports `poll_oneoff`.
+- **Execution time**: Each guest operation must finish within `EXECUTOR_GUEST_EXECUTION_TIMEOUT_MS` (default 10 s), or it is interrupted and the request fails.
+- **Memory**: Guest linear memory is capped by `EXECUTOR_MAX_GUEST_MEMORY_BYTES` (default and maximum 2 GiB). Implement `allocate`/`deallocate` in your `utils` package. The host manages memory lifecycle via these exports.
+- **State size**: The application state is capped by `EXECUTOR_MAX_APP_STATE_SIZE` (default 10 MiB), before and after each call.
+- **No panics**: Explicit panics, index-out-of-range, nil dereference and out-of-memory bypass `recover()` and reach the host as a trap. Check inputs and return the `Error` field instead.
 - **Logging**: Use `utils.LogError/Warn/Info/Debug/Trace` — output is written to stdout with level prefixes (ERR/WRN/INF/DBG/TRC) and captured by the host via WASI pipes.
 
 ---
@@ -625,18 +619,18 @@ On Executor restart, the keyset recovery mechanism (controlled by `EXECUTOR_KEYS
 
 ## 7. Deployment Architecture (Docker Compose)
 
-The local development environment runs the full stack via Docker Compose. All images use the `v0.2.0` tag (overridable via the `VELA_IMAGE_TAG` env var).
+The local development environment runs the full stack via Docker Compose. All images use the `v0.3.0` tag (overridable via the `VELA_IMAGE_TAG` env var).
 
 ### 7.1 Services
 
 | Service | Image | Purpose |
 |---------|-------|---------|
-| `executor` | `horizen/cce-executor:v0.2.0` | WASM execution inside emulated TEE |
-| `manager` | `horizen/cce-manager:v0.2.0` | Orchestration, blockchain polling, state storage |
-| `authorityservice` | `horizen/cce-authorityservice:v0.2.0` | Deanonymization report retrieval API |
-| `chain` | `horizen/cce-chain:v0.2.0` | Anvil dev chain (Foundry) |
-| `deployer` | `horizen/cce-deployer:v0.2.0` | Smart contract deployment (runs once) |
-| `subgraph-deployer` | `horizen/cce-subgraph-deployer:v0.2.0` | Subgraph deployment (runs once) |
+| `executor` | `horizen/cce-executor:v0.3.0` | WASM execution inside emulated TEE |
+| `manager` | `horizen/cce-manager:v0.3.0` | Orchestration, blockchain polling, state storage |
+| `authorityservice` | `horizen/cce-authorityservice:v0.3.0` | Deanonymization report retrieval API |
+| `chain` | `horizen/cce-chain:v0.3.0` | Anvil dev chain (Foundry) |
+| `deployer` | `horizen/cce-deployer:v0.3.0` | Smart contract deployment (runs once) |
+| `subgraph-deployer` | `horizen/cce-subgraph-deployer:v0.3.0` | Subgraph deployment (runs once) |
 | `subgraph-node` | `graphprotocol/graph-node` | The Graph indexing |
 | `subgraph-postgres` | `postgres:14` | Graph Node database |
 | `subgraph-ipfs` | `ipfs/kubo:v0.17.0` | IPFS for subgraph storage |
@@ -695,6 +689,9 @@ Only the chain RPC (port 8545), authority service (port 8081), and subgraph quer
 | `EXECUTOR_FIXED_STATE_KEY` | AES-256 key (dev mode only) |
 | `EXECUTOR_FUEL_PRICE_PER_UNIT` | Wei per fuel unit |
 | `EXECUTOR_MIN_FEE_PER_REQUEST` | Minimum fee enforced per request |
+| `EXECUTOR_MAX_APP_STATE_SIZE` | Max application state size in bytes, before and after each guest call (default 10 MiB, `0` = no limit) |
+| `EXECUTOR_MAX_GUEST_MEMORY_BYTES` | Max linear memory per WASM guest in bytes (`0` = default 2 GiB, which is also the maximum) |
+| `EXECUTOR_GUEST_EXECUTION_TIMEOUT_MS` | Wall-clock limit for one guest operation in ms (`0` = default 10000, max 300000). Must stay at least 3 s below `MANAGER_COMMUNICATION_PARAMS_REQUEST_TIMEOUT_SEC`, or the executor refuses the manager at handshake |
 | `EXECUTOR_COMMUNICATION_PARAMS_REQUEST_TIMEOUT_SEC` | Executor-side request timeout |
 | `LOG_SERVER_IP_HOST` | Log server IP (points to Manager) |
 | `EXECUTOR_LOG_*` | Logging configuration (kind, console, file, level, color) |
@@ -709,8 +706,9 @@ Only the chain RPC (port 8545), authority service (port 8081), and subgraph quer
 | `MANAGER_DATA_FOLDER` | Path for LevelDB storage (default: `/data`) |
 | `MANAGER_REPORTS_FOLDER` | Path for deanonymization reports (default: `/reports`) |
 | `MANAGER_ADMIN_COMMUNICATION_PARAMS_REQUEST_TIMEOUT_SEC` | Admin request timeout |
-| `MANAGER_COMMUNICATION_PARAMS_REQUEST_TIMEOUT_SEC` | Executor communication timeout |
+| `MANAGER_COMMUNICATION_PARAMS_REQUEST_TIMEOUT_SEC` | Executor communication timeout (default 30 s); also the execution budget for a whole batch |
 | `BLOCKCHAIN_POLLING_INTERVAL` | Seconds between blockchain polls |
+| `MAX_BATCH_SIZE` | Max number of requests of one application fetched and processed per poll (default 5, must be > 0) |
 | `REORG_TIMEOUT` | Wait time for chain reorganization stabilization |
 | `HANDSHAKE_TIMEOUT` | Keyset handshake timeout |
 | `CHAIN_RPC_PROTOCOL` | RPC protocol (`http` or `https`) |

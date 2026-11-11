@@ -4,7 +4,7 @@ It starts a dev chain using [Foundry Anvil](https://getfoundry.sh/anvil/overview
 #### Limitations of this dev enviroment:
 
 - the TEE is only emulated (no real AWS Nitro Enclave is used, just a separate process)
-- based on Vela 0.2.0 tag
+- based on Vela 0.3.0 tag
 
 ## Instructions:
 
@@ -47,13 +47,14 @@ It starts a dev chain using [Foundry Anvil](https://getfoundry.sh/anvil/overview
 - **Chain data deleted** (`docker volume rm dockerfiles_vela-skit-chain-data`): the deployer detects contracts are missing from the chain and redeploys.
 - **Deploy data deleted** (`docker volume rm dockerfiles_vela-skit-deploy-data`): the deployer redeploys (same addresses since Anvil is deterministic with the same nonce).
 - **Contracts modified**: rebuild the deployer image, delete both volumes, and restart.
+- **Upgrading from a previous Vela version**: run `docker compose down -v` before `docker compose up`. Otherwise the deployer finds the old contracts on the existing chain, skips deployment, and the new Manager and Executor run against the old contracts.
 
 ## Where to go next
 The system is up and running, and you can deploy an app on-chain via the descriptor flow. Each deploy derives its own `applicationId` from the on-chain `requestId`, so there is no need to rename the WASM file or reserve a fixed id.
 
 Practical how-to for the `vela-nova` test app (Private transfer):
-- go to https://github.com/HorizenOfficial/vela-nova/releases/tag/v0.2.0 <br>
-*(look for 0.2.0 tag for a compatible version with this dev enviroment)*
+- go to https://github.com/HorizenOfficial/vela-nova/releases/tag/v0.3.0 <br>
+*(look for 0.3.0 tag for a compatible version with this dev enviroment)*
 - download `payment_app.wasm` and `novaw-linux` wallet
 - use the novaw-linux wallet executable to submit the deploy and interact with the app:
 
@@ -63,6 +64,8 @@ Practical how-to for the `vela-nova` test app (Private transfer):
 
     The wallet uploads the WASM to the authority service (`POST /deploy/upload`) and submits the on-chain deploy request; the Manager picks it up, forwards the artifact to the Executor, and the TEE verifies the WASM fingerprint against the on-chain descriptor before loading the module.
 
+    To pass constructor params to the app, add either `--allowed-tokens MOCK,0x...` (ERC-20 symbols/addresses to allowlist) or `--deploy-payload '<json>'` (any valid JSON, passed verbatim to the app's `deploy`). The two options cannot be combined.
+
     For deploying an app, your wallet account needs to have the `DEPLOYER_ROLE` role. In this setup, the default account with `DEPLOYER_ROLE` role can be found in .env.dev file in DEPLOYER_PRIVATE_KEY variable. If you submit deploys from a different account, grant it first the `DEPLOYER_ROLE` role with the ProcessorEndpoint management script (`contracts/scripts/management/addAllowedDeployer.ts`) using the admin account.
 
 
@@ -70,11 +73,13 @@ Practical how-to for the `vela-nova` test app (Private transfer):
     
     ```
     rpcUrl=http://localhost:8545
-    ProcessorAddress=0xDc64a140Aa3E981100a9becA4E685f962f0cF6C9
-    TeeAuthenticatorAddress=0x9fE46736679d2D9a65F0992F2272dE9f3c7fa6e0
+    ProcessorAddress=0xa513E6E4b8f2a923D98304ec87F64353C4D5C853
+    TeeAuthenticatorAddress=0xCf7Ed3AccA5a467e9e704C703E8D87F634fB0Fc9
     AuthorityServiceURL=http://localhost:8081
     SubgraphURL=http://localhost:8000/subgraphs/name/hcce
     ```
+    These are the (proxy) addresses the deployer produces on a freshly reset chain; they only hold while the contract deploy sequence is unchanged. The authoritative values for a run are printed in the deployer log (`docker logs vela-skit-deployer`).
+
     You will need also to set two keys property:
     - keySecp256k1 property: you can use one of the private keys of the defaults Anvil accounts, which are pre-founded with 1000 ETH.
     - keyP521 (used for private communication with the TEE): you can generate one with: <br>
@@ -99,7 +104,7 @@ Practical how-to for the `vela-nova` test app (Private transfer):
 ### Other useful repositories to look into:
 
 - https://github.com/HorizenOfficial/vela-common-ts <br>
-*(look for 0.2.0 tag for a compatible version with this dev enviroment)*
+*(look for 0.3.0 tag for a compatible version with this dev enviroment)*
 
     TypeScript library for interacting with Vela CCE (Confidential Computing Environment) smart contracts.<br>
     Provides P-521 ECDH encryption and a blockchain client optimized for browser applications.
