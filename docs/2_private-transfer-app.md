@@ -1,4 +1,4 @@
-# Building a Private Transfer App on Vela (v0.2.0)
+# Building a Private Transfer App on Vela (v0.3.0)
 
 This document walks through the implementation of a real WASM application for the Vela CCE platform: a **private transfer app** that supports deposits, account-to-account transfers, withdrawals to external addresses, and regulatory deanonymization. It serves as a practical reference for developers building their own applications.
 It shows some code snippets in GO language.
@@ -8,7 +8,7 @@ It shows some code snippets in GO language.
 App code is available in the following repository:
 
 https://github.com/HorizenOfficial/vela-nova <br>
-*(this guide is based on v0.2.0 tag)*
+*(this guide is based on v0.3.0 tag)*
 
 
 
@@ -55,8 +55,8 @@ The app references the main vela repository and the shared WASM types library:
 
 ```
 require (
-    github.com/HorizenOfficial/vela v0.2.0
-    github.com/HorizenOfficial/vela-common-go v0.2.0
+    github.com/HorizenOfficial/vela v0.3.0
+    github.com/HorizenOfficial/vela-common-go v0.3.0
 )
 ```
 
@@ -64,7 +64,7 @@ Common WASM types (`Address`, `Uint256`, `PlainEvent`, `Withdrawal`, result stru
 
 | Package | Provides |
 |---------|----------|
-| `vela-common-go/wasm/types` | Core types (`Address`, `Uint256`, `PlainEvent`, `AppEvent`, `Withdrawal`), result types (`LoadModuleResult`, `DepositResult`, `ProcessResult`, `DeployResult`), serialization helpers (`SerializeAndWriteResult`, `PtrToAddress`, `PtrToUint256`) |
+| `vela-common-go/wasm/types` | Core types (`Address`, `Uint256`, `PlainEvent`, `AppEvent`, `Withdrawal`), result types (`DeployResult`, `DepositResult`, `ProcessResult`), serialization helpers (`SerializeAndWriteResult`, `PtrToAddress`, `PtrToUint256`) |
 | `vela-common-go/wasm/utils` | Memory management (`allocate`/`deallocate`, `BytesToPtr`, `get_allocated_memory_stats`), pointer conversion (`PtrToString`), logging (`LogError/Warn/Info/Debug/Trace`) |
 | `vela/pkg/common` | Request type constants (`Deploy`, `Process`, `Deanonymize`, `AssociateKey`) used for routing inside `process_request` |
 | `app` (local) | Application-specific business logic, state types, instruction types, event types |
@@ -140,7 +140,7 @@ Design choices:
 
 ## Step 3: Implement the WASM Exports
 
-Your module must export these functions: `deploy`, `load_module`, `deposit`, `process_request`, plus `allocate`/`deallocate` (provided by `vela-common-go/wasm/utils`).
+Your module must export these functions: `deploy`, `deposit`, `process_request`, plus `allocate`/`deallocate` (provided by `vela-common-go/wasm/utils`). There is no initialization export: on first use of an app, or after an Executor restart, the host only compiles the module and supplies the state from storage.
 
 ### main.go — The Bridge Layer
 
@@ -157,12 +157,6 @@ import (
 func deploy(appId int64, paramsPtr *byte, paramsLen int32) *byte {
     paramsJSON := utils.PtrToString(paramsPtr, paramsLen)
     result := app.Deploy(appId, paramsJSON)
-    return types.SerializeAndWriteResult(result)
-}
-
-//export load_module
-func load_module(appId int64) *byte {
-    result := app.LoadModule(appId)
     return types.SerializeAndWriteResult(result)
 }
 
@@ -243,25 +237,6 @@ func Deploy(appId int64, paramsJSON string) types.DeployResult {
     }
     stateJSON, _ := json.Marshal(initialState)
     return types.DeployResult{
-        State: stateJSON,
-        Fuel:  types.NewUint256(5),
-    }
-}
-```
-
-### LoadModule — Cache Warm-Up Fallback
-
-Called by the Executor on restart to rebuild the default-initial-state cache entry without re-running the constructor. Returns the same minimal state as `Deploy` with no constructor input (ETH-only allowlist). Apps never need to call this themselves.
-
-```go
-func LoadModule(appId int64) types.LoadModuleResult {
-    initialState := &ApplicationInternalState{
-        AppID:         uint64(appId),
-        Accounts:      make(map[string]*AccountState),
-        AllowedTokens: map[string]bool{ethTokenHex: true},
-    }
-    stateJSON, _ := json.Marshal(initialState)
-    return types.LoadModuleResult{
         State: stateJSON,
         Fuel:  types.NewUint256(5),
     }
@@ -714,7 +689,7 @@ Every operation must return a `Fuel` value representing computation cost. The fe
 
 | Operation | Fuel |
 |-----------|------|
-| `LoadModule` | 5 |
+| `Deploy` | 5 |
 | `Deposit` | 35 |
 | `ProcessRequest` (transfer or withdraw) | 50 |
 | `ProcessRequest` (deanonymize) | 20 |
@@ -760,7 +735,10 @@ Since your code compiles with TinyGo (not standard Go), keep these limitations i
 | **No `reflect`-heavy code** | Avoid packages that rely on deep reflection |
 | **Limited stdlib** | `net`, `os` (beyond basics), `math/big`, and some other packages are unavailable |
 | **Determinism required** | No `time.Now()`, no random numbers — same inputs must produce same outputs |
-| **Stateless execution** | No global mutable state between invocations; everything goes through the state parameter |
+| **Stateless execution** | Every call runs on a fresh instance, so globals are reset on every call; everything goes through the state parameter |
+| **Allowed host imports** | Only the WASI imports TinyGo emits for a guest with no I/O are accepted; anything else (e.g. `poll_oneoff`, pulled in by `time.Sleep`) is refused at deploy |
+| **Execution limits** | Each guest operation must finish within `EXECUTOR_GUEST_EXECUTION_TIMEOUT_MS` (default 10 s); memory is capped at 2 GiB and app state at `EXECUTOR_MAX_APP_STATE_SIZE` (default 10 MiB) |
+| **No panics** | Panics, index-out-of-range and nil dereferences bypass `recover()` and trap; validate inputs and return the `Error` field instead |
 | **JSON serialization** | `encoding/json` works. Keep state structures simple |
 | **Logging** | Use `utils.LogError/Warn/Info/Debug/Trace` — writes to stdout with level prefixes (ERR/WRN/INF/DBG/TRC), captured by host via WASI pipe |
 | **Memory** | `allocate`/`deallocate` are provided by `vela-common-go/wasm/utils` — auto-exported by TinyGo |
@@ -772,14 +750,14 @@ Since your code compiles with TinyGo (not standard Go), keep these limitations i
 
 To test this app with the local dev environment:
 
-1. Download `payment_app.wasm` from https://github.com/HorizenOfficial/vela-nova/releases/tag/v0.2.0
+1. Download `payment_app.wasm` from https://github.com/HorizenOfficial/vela-nova/releases/tag/v0.3.0
 3. Start the environment: `cd dockerfiles && cp .env.dev .env && docker compose up`
 4. Download the `novaw-linux` wallet from the same release page
 5. Configure `wallet.conf` (from `wallet.conf.template`):
     ```
     rpcUrl=http://localhost:8545
-    ProcessorAddress=0xDc64a140Aa3E981100a9becA4E685f962f0cF6C9
-    TeeAuthenticatorAddress=0x9fE46736679d2D9a65F0992F2272dE9f3c7fa6e0
+    ProcessorAddress=0xa513E6E4b8f2a923D98304ec87F64353C4D5C853
+    TeeAuthenticatorAddress=0xCf7Ed3AccA5a467e9e704C703E8D87F634fB0Fc9
     AuthorityServiceURL=http://localhost:8081
     SubgraphURL=http://localhost:8000/subgraphs/name/hcce
     ```
@@ -788,12 +766,13 @@ To test this app with the local dev environment:
     - `keyP521`: generate with `./novaw-linux generatekeys`
 7. Deploy and interact:
     ```bash
-    ./novaw-linux deployapp --wasm /absolute/path/to/payment_app.wasm --max-value-fee "100 wei" (Use an account with `DEPLOYAPP` role)
+    ./novaw-linux deployapp --wasm /absolute/path/to/payment_app.wasm --max-value-fee "100 wei" (Use an account with `DEPLOYER_ROLE`)
     ./novaw-linux registeruser
     ./novaw-linux getpublicbalance
     ./novaw-linux deposit -a "1 ETH"
     ./novaw-linux getprivatebalance
     ```
+    `deployapp` accepts two mutually exclusive options for the constructor params: `--allowed-tokens MOCK,0x...` (ERC-20 symbols/addresses, sent as `{"allowedTokens":[...]}`) or `--deploy-payload '<json>'` (any valid JSON, passed verbatim to `deploy`).
 
 ---
 
@@ -803,7 +782,7 @@ Building an application on Vela CCE comes down to:
 
 1. **Define your state** — a JSON-serializable struct that holds all application data.
 2. **Import shared types** — use `Address`, `Uint256`, `PlainEvent`, `AppEvent`, `Withdrawal`, and result types from `vela-common-go/wasm/types`.
-3. **Implement the exports** — `deploy` (init with constructor params), `load_module` (cache warm-up fallback), `deposit` (fund accounts per token), `process_request` (transfers, withdrawals, and deanonymization via `requestType` routing).
+3. **Implement the exports** — `deploy` (init with constructor params), `deposit` (fund accounts per token), `process_request` (transfers, withdrawals, and deanonymization via `requestType` routing).
 4. **Memory management** — `allocate`/`deallocate` are provided by `vela-common-go/wasm/utils`.
 5. **Return results** — updated state, events for users (subtype as `[32]byte`), withdrawals for on-chain transfers (with per-token `TokenAddress`), fuel for fee calculation, and optional report for deanonymization.
 6. **Handle errors** — return early with an `Error` string; never leave state partially modified.
@@ -815,6 +794,6 @@ The Executor handles all cryptography (state encryption, event encryption, paylo
 
 | Resource | URL |
 |----------|-----|
-| Vela Nova (test app source) | https://github.com/HorizenOfficial/vela-nova/releases/tag/v0.2.0 |
+| Vela Nova (test app source) | https://github.com/HorizenOfficial/vela-nova/releases/tag/v0.3.0 |
 | Vela Common TS (browser client) | https://github.com/HorizenOfficial/vela-common-ts |
 | Local dev environment | `dockerfiles/` in this repository |
